@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.18)
+project(ppdoclayout LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+option(USE_CUDA "build with CUDA backend" OFF)
+if(USE_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+endif()
+
+# init ggml submodule + apply FP32 parity patch (idempotent)
+find_package(Git QUIET)
+if(GIT_FOUND)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt")
+        execute_process(COMMAND "${GIT_EXECUTABLE}" submodule update --init ggml
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C ggml apply --check
+                            "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fp32-parity.patch"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    RESULT_VARIABLE PPDL_PATCH_CHECK
+                    ERROR_QUIET)
+    if(PPDL_PATCH_CHECK EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C ggml apply
+                                "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fp32-parity.patch"
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        message(STATUS "applied patches/ggml-fp32-parity.patch to ggml")
+    else()
+        message(STATUS "ggml FP32 parity patch already applied (or not applicable)")
+    endif()
+endif()
+
+add_subdirectory(ggml)
+
+add_library(ppdoclayout_c SHARED src/ppdoclayout.cpp)
+target_include_directories(ppdoclayout_c PUBLIC include)
+target_compile_definitions(ppdoclayout_c PRIVATE PPDL_BUILD)
+target_link_libraries(ppdoclayout_c PRIVATE ggml)
+
+add_executable(ppdoclayout src/main.cpp)
+target_link_libraries(ppdoclayout PRIVATE ppdoclayout_c)

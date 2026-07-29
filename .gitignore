@@ -1,0 +1,31 @@
+# build
+build-*/
+rust/ppdoclayout/target/
+Cargo.lock
+
+# large model artifacts
+*.onnx
+*.safetensors
+*.gguf
+PP-DocLayoutV3_safetensors/
+
+# generated / debug artifacts
+dump_*/
+out_*/
+ref/
+__pycache__/
+*.pyc
+
+# tests (not committed)
+test_compare.py
+run_tests.bat
+cmp.py
+ref_dump.py
+test_data/
+reference/
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

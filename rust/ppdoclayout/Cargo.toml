@@ -1,0 +1,9 @@
+[package]
+name = "ppdoclayout"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for PP-DocLayoutV3 ggml inference (ppdoclayout_c)"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]

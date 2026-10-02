@@ -38,3 +38,11 @@ bench/ggml_out/
 __pycache__/
 bench/dv/
 bench/smoke/
+
+# bulk oracle artifacts
+bench/dbgout/
+bench/dbgmanifest.txt
+bench/dbgpage.bin
+bench/results.jsonl
+bench/seen_thumbs.json
+bench/scratch/

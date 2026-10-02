@@ -91,11 +91,14 @@ is dominated by the backbone's memory traffic; numerics stay FP32 throughout
 
 ## Correctness
 
-`bench/` holds the oracle harness: 12 pages from 6 PDFs (EN papers, ZH slides,
-formula-heavy proofs, ZH reports) are pushed through both this library and the
-Paddle2ONNX export with identical input tensors. Acceptance: every detection
-above score 0.3 matches exactly (label, reading order, boxes to 0.05 px,
-masks to IoU 0.999) and the selected top-300 sets are equal.
+`bench/` holds the oracle harness against the Paddle2ONNX export with
+identical input tensors. Full-corpus run (2026-10): **4261 unique pages from
+37 local PDFs** (EN/ZH papers, slides, formula-dense math books, engineering
+drawings) — every confident detection (score >= 0.3) on every page has an
+identical class, identical relative reading order, a box within 0.14 px and
+mask IoU >= 0.99. Residual cross-backend FP32 divergence is confined to the
+third decimal of individual scores on rare hard queries (max observed 2.6e-3)
+and to rank shuffling among background detections; see `bench/README.md`.
 
 2026-10 fix: the reading-order head previously consumed the `dec_norm` output;
 it must consume the final decoder hidden state *before* that norm (as in the

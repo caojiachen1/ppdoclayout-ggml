@@ -41,6 +41,7 @@ int main(int argc, char ** argv) {
     const char * out_dir    = ".";
     const char * dump_dir   = nullptr;
     const char * dump_raw_pfx = nullptr;
+    const char * batch_path = nullptr;
     std::string  backend_name = "cpu";
     int ori_h = PPDL_IMG_SIZE, ori_w = PPDL_IMG_SIZE;
     int bench = 0;
@@ -58,15 +59,41 @@ int main(int argc, char ** argv) {
         else if (a == "--ori-w")     ori_w       = atoi(next());
         else if (a == "--backend")   backend_name = next();
         else if (a == "--bench")     bench       = atoi(next());
-        else if (a == "--dump-dir")  dump_dir    = next();
-        else if (a == "--dump-raw") dump_raw_pfx = next();
+    else if (a == "--dump-dir")  dump_dir    = next();
+    else if (a == "--dump-raw") dump_raw_pfx = next();
+    else if (a == "--batch")     batch_path  = next();
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
-    if (!input_path) { fprintf(stderr, "usage: ppdoclayout -m model.gguf -i input.bin --ori-h H --ori-w W -o outdir [--backend cpu|cuda] [--bench N] [--dump-dir d] [--dump-raw pfx]\n"); return 1; }
+    if (!input_path && !batch_path) { fprintf(stderr, "usage: ppdoclayout -m model.gguf -i input.bin --ori-h H --ori-w W -o outdir [--backend cpu|cuda] [--bench N] [--dump-dir d] [--dump-raw pfx] | --batch manifest\n"); return 1; }
 
     const int backend = backend_name == "cuda" ? PPDL_BACKEND_CUDA : PPDL_BACKEND_CPU;
     ppdl_ctx * ctx = ppdl_init_ex(model_path, backend, dump_dir != nullptr);
     if (!ctx) return 1;
+
+    // batch mode: manifest lines "in.bin|outdir|ori_h|ori_w", model loaded once
+    if (batch_path) {
+        FILE * mf = fopen(batch_path, "r");
+        if (!mf) { fprintf(stderr, "cannot open %s\n", batch_path); return 1; }
+        char line[1024];
+        int idx = 0, fails = 0;
+        while (fgets(line, sizeof line, mf)) {
+            char in[900]; int bh = 0, bw = 0; char od[900] = ".";
+            if (sscanf(line, "%899[^|]|%899[^|]|%d|%d", in, od, &bh, &bw) != 4) continue;
+            std::vector<float> img((size_t) 3 * PPDL_IMG_SIZE * PPDL_IMG_SIZE);
+            if (!read_file(in, img.data(), img.size() * 4)) { fprintf(stderr, "read fail %s\n", in); fails++; continue; }
+            MKDIR(od);
+            ppdl_result res;
+            if (ppdl_infer(ctx, img.data(), bh, bw, &res) != 0) { fprintf(stderr, "infer fail %s\n", in); fails++; continue; }
+            const std::string odd = od;
+            write_file(odd + "/out0.bin", res.dets, (size_t) res.num_dets * PPDL_DET_FIELDS * 4);
+            write_file(odd + "/out2.bin", res.masks, (size_t) res.num_dets * PPDL_MASK_HW * PPDL_MASK_HW * 4);
+            idx++;
+        }
+        fclose(mf);
+        fprintf(stderr, "batch: %d done, %d failed\n", idx, fails);
+        ppdl_free(ctx);
+        return fails ? 1 : 0;
+    }
 
     std::vector<float> img((size_t) 3 * PPDL_IMG_SIZE * PPDL_IMG_SIZE);
     if (!read_file(input_path, img.data(), img.size() * 4)) {

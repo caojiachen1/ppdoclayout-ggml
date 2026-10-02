@@ -79,6 +79,8 @@ ppdl_ctx * ppdl_init   (const char * model_path, int backend);          // backe
 ppdl_ctx * ppdl_init_ex(const char * model_path, int backend, int enable_dumps);
 int        ppdl_infer  (ppdl_ctx *, const float * image_chw, int ori_h, int ori_w, ppdl_result *);
 int        ppdl_dump   (ppdl_ctx *, const char * dir);                  // 需 init_ex(enable_dumps=1)，调试用
+int        ppdl_dump_raw(ppdl_ctx *, const char * pfx);                 // 导出上次推理的解码器原始输出：<pfx>logits.bin (300x25)、
+                                                                          // <pfx>boxes.bin (300x4)、<pfx>order.bin (300x300)、<pfx>sel.bin (300 个 i32)
 void       ppdl_free   (ppdl_ctx *);
 ```
 
@@ -227,7 +229,7 @@ rem 或者显式指定：
 cmake -S . -B build-cuda -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real
 ```
 
-- 数值一致性补丁与架构无关，Blackwell 上同样生效（ggml 为 submodule，补丁存于 `patches/ggml-fp32-parity.patch`，**cmake configure 时自动初始化 submodule 并幂等打补丁**，无需手动操作）：
+- 数值一致性补丁与架构无关，Blackwell 上同样生效（ggml 为 submodule，补丁存于 `patches/ggml-ppdl.patch`，**cmake configure 时自动初始化 submodule 并幂等打补丁**，无需手动操作）：
   - `ggml/src/ggml-cuda/common.cuh`：cuBLAS 强制 `CUBLAS_DEFAULT_MATH`（禁 TF32）；
   - `ggml/src/ggml-cuda/mmf.cu`：禁用 F32 mmf（TF32 MMA）路径，对所有 `cc >= Ampere`（含 Blackwell）生效。
 

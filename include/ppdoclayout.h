@@ -54,6 +54,12 @@ PPDL_API int ppdl_infer(ppdl_ctx * ctx, const float * image_chw,
    ppdl_init_ex with enable_dumps). Returns 0 on success. */
 PPDL_API int ppdl_dump(ppdl_ctx * ctx, const char * dir);
 
+/* Write raw graph outputs of the last infer with path prefix:
+   <pfx>logits.bin (300x25 f32), <pfx>boxes.bin (300x4 sigmoid cxcywh f32),
+   <pfx>order.bin (300x300 f32, [j + 300*i] = k_i . q_j), <pfx>sel.bin (300 i32,
+   flat q*25+c indices chosen by postprocess, rank order). Returns 0 on success. */
+PPDL_API int ppdl_dump_raw(ppdl_ctx * ctx, const char * pfx);
+
 PPDL_API void ppdl_free(ppdl_ctx * ctx);
 
 #ifdef __cplusplus

@@ -79,6 +79,8 @@ ppdl_ctx * ppdl_init   (const char * model_path, int backend);          // backe
 ppdl_ctx * ppdl_init_ex(const char * model_path, int backend, int enable_dumps);
 int        ppdl_infer  (ppdl_ctx *, const float * image_chw, int ori_h, int ori_w, ppdl_result *);
 int        ppdl_dump   (ppdl_ctx *, const char * dir);                  // requires init_ex(enable_dumps=1); debugging only
+int        ppdl_dump_raw(ppdl_ctx *, const char * pfx);                 // raw decoder outputs of the last infer: <pfx>logits.bin (300x25),
+                                                                          // <pfx>boxes.bin (300x4), <pfx>order.bin (300x300), <pfx>sel.bin (300 i32)
 void       ppdl_free   (ppdl_ctx *);
 ```
 
@@ -227,7 +229,7 @@ rem or specify explicitly:
 cmake -S . -B build-cuda -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real
 ```
 
-- The numerical-parity patches are architecture-independent and equally effective on Blackwell (ggml is a git submodule; the patches live in `patches/ggml-fp32-parity.patch` and are **applied automatically and idempotently at cmake configure time** — no manual steps required):
+- The numerical-parity patches are architecture-independent and equally effective on Blackwell (ggml is a git submodule; the patches live in `patches/ggml-ppdl.patch` and are **applied automatically and idempotently at cmake configure time** — no manual steps required):
   - `ggml/src/ggml-cuda/common.cuh`: force `CUBLAS_DEFAULT_MATH` for cuBLAS (disables TF32);
   - `ggml/src/ggml-cuda/mmf.cu`: disable the F32 mmf (TF32 MMA) path, effective for all `cc >= Ampere` (including Blackwell).
 

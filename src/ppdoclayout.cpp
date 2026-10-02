@@ -45,12 +45,35 @@ static const int NTOK       = 13125;
 
 struct dump_entry { std::string name; ggml_tensor * t; };
 
+// Tag a custom-op tensor so the patched ggml-cuda can run it on the GPU
+// (slots 12/13 of op_params are unused by ggml_custom_op_params).
+static void tag_custom_op(ggml_tensor * t, int id) {
+    t->op_params[12] = 0x5050444Cu;
+    t->op_params[13] = id;
+}
+
+// host callback for the GPU conv op; running it on CPU is a placement bug
+static void op_conv_unsupported(ggml_tensor *, int, int, void *) {
+    fprintf(stderr, "ppdl: custom conv op ran on CPU (unsupported)\n");
+    exit(1);
+}
+
 // ---------------------------------------------------------------- custom ops
 // all run on CPU; sched migrates inputs automatically
+
+static double op_now_ms() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static bool ops_time_dbg() {
+    static const bool e = getenv("PPDL_OPS_TIME") != nullptr;
+    return e;
+}
 
 // src0: class logits ne(25, 13125) -> dst i32 ne(300): indices of top-300
 // queries by max-class logit, descending, ties -> lower index first
 static void op_topk300(ggml_tensor * dst, int ith, int nth, void *) {
+    const double t0 = ith == 0 && ops_time_dbg() ? op_now_ms() : 0.0;
     if (ith != 0) return;
     const ggml_tensor * s = dst->src[0];
     const float * lg = (const float *) s->data;
@@ -69,11 +92,13 @@ static void op_topk300(ggml_tensor * dst, int ith, int nth, void *) {
     });
     int32_t * out = (int32_t *) dst->data;
     for (int i = 0; i < NQ; i++) out[i] = idx[i];
+    if (t0 != 0.0) fprintf(stderr, "[op] topk300 %.2f ms\n", op_now_ms() - t0);
 }
 
 // src0: mask logits ne(40000, 300) -> dst f32 ne(4, 300):
 // inverse_sigmoid(mask_to_box(logit > 0)), cxcywh normalized by 200
 static void op_mask_box(ggml_tensor * dst, int ith, int nth, void *) {
+    const double t0 = ith == 0 && ops_time_dbg() ? op_now_ms() : 0.0;
     const ggml_tensor * s = dst->src[0];
     const float * ml = (const float *) s->data;
     float * out = (float *) dst->data;
@@ -111,6 +136,7 @@ static void op_mask_box(ggml_tensor * dst, int ith, int nth, void *) {
         float * o = out + (size_t) q * 4;
         o[0] = invsig(cx); o[1] = invsig(cy); o[2] = invsig(bw); o[3] = invsig(bh);
     }
+    if (t0 != 0.0) fprintf(stderr, "[op] mask_box %.2f ms\n", op_now_ms() - t0);
 }
 
 // multiscale deformable attention
@@ -120,6 +146,7 @@ static void op_mask_box(ggml_tensor * dst, int ith, int nth, void *) {
 // src3 ref cxcywh sigmoid space ne(4,300)
 // dst ne(256,300)
 static void op_msdeform(ggml_tensor * dst, int ith, int nth, void *) {
+    const double t0 = ith == 0 && ops_time_dbg() ? op_now_ms() : 0.0;
     const float * val = (const float *) dst->src[0]->data;
     const float * off = (const float *) dst->src[1]->data;
     const float * awr = (const float *) dst->src[2]->data;
@@ -167,6 +194,7 @@ static void op_msdeform(ggml_tensor * dst, int ith, int nth, void *) {
             }
         }
     }
+    if (t0 != 0.0) fprintf(stderr, "[op] msdeform %.2f ms (threads %d)\n", op_now_ms() - t0, nth);
 }
 
 // ---------------------------------------------------------------- model
@@ -175,9 +203,12 @@ struct model {
     ggml_context * ctx_w = nullptr;
     gguf_context * gctx  = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
+    ggml_context * ctx_r = nullptr;  // repacked conv weights (K*K, IC, OC), CUDA path
+    ggml_backend_buffer_t rbuf = nullptr;
 
     ggml_tensor * get(const std::string & name) const {
-        ggml_tensor * t = ggml_get_tensor(ctx_w, name.c_str());
+        ggml_tensor * t = ctx_w ? ggml_get_tensor(ctx_w, name.c_str()) : nullptr;
+        if (!t && ctx_r) t = ggml_get_tensor(ctx_r, name.c_str());
         if (!t) { fprintf(stderr, "missing tensor: %s\n", name.c_str()); exit(1); }
         return t;
     }
@@ -214,6 +245,51 @@ static bool load_model(model & m, const char * path, ggml_backend_t backend) {
     return true;
 }
 
+// Repack every qualifying conv weight (KW=KH in {1,3}, IC>1) from
+// (KW,KH,IC,OC) to (KW*KH, IC, OC) row-major, as "<name>.wr".
+// The custom conv op consumes this layout directly as per-tap GEMM operands.
+static void repack_convs(model & m, ggml_backend_t dev) {
+    const int64_t n = gguf_get_n_tensors(m.gctx);
+    const size_t meta = 4 * 1024 * 1024 + (size_t) n * ggml_tensor_overhead();
+    ggml_init_params ip = { meta, nullptr, true };
+    m.ctx_r = ggml_init(ip);
+
+    struct pending { ggml_tensor * dst; std::vector<float> data; };
+    std::vector<pending> todo;
+    std::vector<float> src;
+
+    for (int64_t i = 0; i < n; i++) {
+        const char * name = gguf_get_tensor_name(m.gctx, i);
+        const std::string nm(name);
+        if (nm.size() < 7 || nm.substr(nm.size() - 7) != ".weight") continue;
+        ggml_tensor * t = ggml_get_tensor(m.ctx_w, name);
+        if (t->ne[3] <= 1 || t->ne[2] <= 1) continue;         // 4D real conv only
+        if (t->ne[0] != t->ne[1] || (t->ne[0] != 1 && t->ne[0] != 3)) continue;
+        const int64_t KW = t->ne[0], IC = t->ne[2], OC = t->ne[3];
+        const size_t nelem = (size_t) KW * KW * IC * OC;
+        src.resize(nelem);
+        ggml_backend_tensor_get(t, src.data(), 0, nelem * 4);
+        std::vector<float> rp(nelem);
+        for (int oc = 0; oc < OC; oc++)
+            for (int ic = 0; ic < IC; ic++)
+                for (int kh = 0; kh < KW; kh++)
+                    for (int kw = 0; kw < KW; kw++) {
+                        const size_t sidx = (((size_t) oc * IC + ic) * KW + kh) * KW + kw;
+                        const size_t didx = (((size_t) (kh * KW + kw) * IC + ic) * OC) + oc;
+                        rp[didx] = src[sidx];
+                    }
+        ggml_tensor * rt = ggml_new_tensor_3d(m.ctx_r, GGML_TYPE_F32, OC, IC, KW * KW);
+        ggml_set_name(rt, (nm.substr(0, nm.size() - 7) + ".wr").c_str());
+        todo.push_back({rt, std::move(rp)});
+    }
+
+    m.rbuf = ggml_backend_alloc_ctx_tensors(m.ctx_r, dev);
+    for (auto & p : todo) {
+        ggml_backend_tensor_set(p.dst, p.data.data(), 0, p.data.size() * 4);
+    }
+    fprintf(stderr, "ppdl: repacked %zu conv weights for the GEMM-decomposed path\n", todo.size());
+}
+
 // ---------------------------------------------------------------- graph build
 
 struct graph_out {
@@ -234,6 +310,7 @@ struct builder {
     const model  * m;
     graph_out    * out;
     bool           want_dumps;
+    bool           gpu_convs = false; // use the tagged custom conv op (CUDA only)
 
     void dump(const char * name, ggml_tensor * t) {
         if (!want_dumps) return;
@@ -254,6 +331,46 @@ struct builder {
         ggml_tensor * w = m->get(name + ".weight");
         ggml_tensor * b = m->get(name + ".bias");
         ggml_tensor * r;
+        // stride-1 1x1 / 3x3 convs run as the tagged custom op: batched cuBLAS
+        // GEMMs over strided input views (no im2col materialization, no layout
+        // transposes). Requires the ".wr" repacked weights from repack_convs().
+        static const int conv_mode = [] { // debug bisect: 1=k1 only, 2=k3 only, 3=both
+            const char * e = getenv("PPDL_CONV_MODE");
+            return e ? atoi(e) : 3;
+        }();
+        const bool want_k1 = w->ne[0] == 1 && (conv_mode & 1);
+        const bool want_k3 = w->ne[0] == 3 && p <= 1 && (conv_mode & 2);
+        if (gpu_convs && s == 1 && w->ne[0] == w->ne[1] && (want_k1 || want_k3) &&
+            !(w->ne[2] == 1 && x->ne[2] != 1)) { // not depthwise
+            ggml_tensor * xin = x;
+            if (w->ne[0] == 3 && p == 1) {
+                xin = ggml_pad_ext(ctx, x, 1, 1, 1, 1, 0, 0, 0, 0);
+            }
+            const int64_t OW = xin->ne[0] - w->ne[0] + 1;
+            const int64_t OH = xin->ne[1] - w->ne[1] + 1;
+            ggml_tensor * cargs[3] = { xin, m->get(name + ".wr"), b };
+            if (w->ne[0] == 1) {
+                // k1 GEMM writes straight into a CHW (OW,OH,OC) tensor
+                r = ggml_custom_4d(ctx, GGML_TYPE_F32, OW, OH, w->ne[3], 1,
+                                   cargs, 3, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(r, 3);
+                r->op_params[14] = 1 | (p << 8);
+                r->op_params[15] = 0;
+            } else {
+                // k3 writes channel-last data under a (OC,OW,OH) ne convention;
+                // permute+cont turns it into the CHW (OW,OH,OC) everyone expects
+                r = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[3], OW, OH, 1,
+                                   cargs, 3, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(r, 3);
+                r->op_params[14] = 3 | (p << 8);
+                r->op_params[15] = 1;
+                // source axis order (OC, OW, OH) -> logical (OW, OH, OC):
+                // ggml_permute dims say where each SOURCE axis goes
+                r = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
+            }
+            r = ggml_add(ctx, r, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
+            return act(r, a);
+        }
         if (w->ne[2] == 1 && x->ne[2] != 1) { // depthwise
             r = ggml_conv_2d_dw_direct(ctx, w, x, s, s, p, p, 1, 1);
         } else {
@@ -500,6 +617,7 @@ struct builder {
         ggml_tensor * margs[1] = { encm };
         ggml_tensor * refu = ggml_custom_4d(ctx, GGML_TYPE_F32, 4, NQ, 1, 1,
                                             margs, 1, op_mask_box, GGML_N_TASKS_MAX, nullptr);
+        tag_custom_op(refu, 1);
         dump("init_ref_unact", refu);
         ggml_tensor * ref = ggml_sigmoid(ctx, refu);
 
@@ -521,6 +639,7 @@ struct builder {
                                        ggml_cont(ctx, aw), ggml_cont(ctx, ref) };
             ggml_tensor * ca = ggml_custom_4d(ctx, GGML_TYPE_F32, DM, NQ, 1, 1,
                                               cargs, 4, op_msdeform, GGML_N_TASKS_MAX, nullptr);
+            tag_custom_op(ca, 2);
             ca = lin(ca, dp + ".ca.op");
             x = ln(ggml_add(ctx, x, ca), dp + ".ln2");
             // ffn
@@ -538,7 +657,8 @@ struct builder {
         go.boxes  = ref;                                                 // (4,300)
         ggml_tensor * mq6 = mlp3(outq, "mq");
         go.masks = ggml_mul_mat(ctx, mflat, ggml_cont(ctx, mq6));        // (40000,300)
-        ggml_tensor * oh = lin(outq, "order5");
+        // order head consumes the final decoder hidden (pre dec_norm), per the ONNX export
+        ggml_tensor * oh = lin(x, "order5");
         ggml_tensor * gp = lin(oh, "gp");                                // (128,300)
         ggml_tensor * qv = ggml_cont(ctx, ggml_view_2d(ctx, gp, 64, NQ, gp->nb[1], 0));
         ggml_tensor * kv = ggml_cont(ctx, ggml_view_2d(ctx, gp, 64, NQ, gp->nb[1], 64 * sizeof(float)));
@@ -608,8 +728,10 @@ static void postprocess(const std::vector<float> & logits,  // (300,25) row-majo
                         const std::vector<float> & order,   // [j + 300*i] = q_i . k_j / 8
                         const std::vector<float> & maskl,   // (300,40000)
                         int ori_h, int ori_w,
-                        std::vector<float> & out0, std::vector<int32_t> & out2) {
-    // reading order votes (Paddle semantics: antisymmetric logits, column sums)
+                        std::vector<float> & out0, std::vector<int32_t> & out2,
+                        std::vector<int32_t> * sel_out = nullptr) {
+    // reading order votes (Paddle semantics, verified against the ONNX export:
+    // votes[n] = sum_m sigmoid(R[m,n] - R[n,m]) with R == our order matrix)
     std::vector<float> votes(NQ, 0.0f);
     for (int j = 0; j < NQ; j++) {
         float acc = 0.0f;
@@ -646,6 +768,10 @@ static void postprocess(const std::vector<float> & logits,  // (300,25) row-majo
 
     out0.resize((size_t) NQ * 7);
     out2.assign((size_t) NQ * MASK_PIX, 0);
+    if (sel_out) {
+        sel_out->resize(NQ);
+        for (int r = 0; r < NQ; r++) (*sel_out)[r] = fi[r];
+    }
     for (int r = 0; r < NQ; r++) {
         const int flat = fi[r];
         const int q = flat / NC, c = flat % NC;
@@ -665,6 +791,58 @@ static void postprocess(const std::vector<float> & logits,  // (300,25) row-majo
     }
 }
 
+// ---------------------------------------------------------------- profiling
+
+// PPDL_PROFILE=1: phase timing via sched eval callback. Sync points are the
+// custom ops; each phase time = that op + all async GPU work queued before it.
+struct prof_ctx {
+    std::vector<std::pair<std::string, double>> rows; // name, ms
+    std::chrono::steady_clock::time_point t0;
+    ggml_backend_sched_t sched = nullptr;
+};
+
+static bool prof_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    prof_ctx * p = (prof_ctx *) ud;
+    if (ask) {
+        return t->op == GGML_OP_CUSTOM;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - p->t0).count();
+    char buf[160];
+    const char * bn = "?";
+    if (p->sched) {
+        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(p->sched, t);
+        if (b) bn = ggml_backend_name(b);
+    }
+    snprintf(buf, sizeof buf, "%s %s [%s] ne=(%lld,%lld,%lld,%lld)",
+             ggml_op_desc(t), t->name[0] ? t->name : "", bn,
+             (long long) t->ne[0], (long long) t->ne[1],
+             (long long) t->ne[2], (long long) t->ne[3]);
+    p->rows.push_back({std::string(buf), ms});
+    p->t0 = std::chrono::steady_clock::now();
+    return true;
+}
+
+static bool prof_enabled() {
+    const char * e = getenv("PPDL_PROFILE");
+    return e && *e && *e != '0';
+}
+
+static void prof_report(const prof_ctx & p) {
+    fprintf(stderr, "==== phase profile (top 40 by ms) ====\n");
+    std::vector<size_t> idx(p.rows.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    std::partial_sort(idx.begin(), idx.begin() + std::min<size_t>(40, idx.size()), idx.end(),
+                      [&](size_t a, size_t b) { return p.rows[a].second > p.rows[b].second; });
+    double total = 0;
+    for (auto & r : p.rows) total += r.second;
+    for (size_t k = 0; k < std::min<size_t>(40, idx.size()); k++) {
+        const auto & r = p.rows[idx[k]];
+        fprintf(stderr, "%8.2f ms %5.1f%% %s\n", r.second, 100.0 * r.second / total, r.first.c_str());
+    }
+    fprintf(stderr, "sum-of-phases %.1f ms over %zu sync points\n", total, p.rows.size());
+}
+
 // ---------------------------------------------------------------- C API
 
 #include "ppdoclayout.h"
@@ -679,6 +857,12 @@ struct ppdl_ctx {
     bool computed = false;
     std::vector<float>   out0;
     std::vector<int32_t> out2;
+    std::vector<float>   raw_logits;   // (300,25)
+    std::vector<float>   raw_boxes;    // (300,4) sigmoid cxcywh
+    std::vector<float>   raw_order;    // (300,300)
+    std::vector<int32_t> raw_sel;      // flat indices chosen by postprocess top-300
+    prof_ctx prof;
+    bool profile = false;
 };
 
 static bool write_file(const std::string & path, const void * src, size_t nbytes) {
@@ -711,6 +895,9 @@ extern "C" PPDL_API ppdl_ctx * ppdl_init_ex(const char * model_path, int backend
         ppdl_free(c);
         return nullptr;
     }
+    if (backend == PPDL_BACKEND_CUDA) {
+        repack_convs(c->m, c->backends[0]);
+    }
     fprintf(stderr, "ppdl: loaded %s (%lld tensors) on %s\n", model_path,
             (long long) gguf_get_n_tensors(c->m.gctx), ggml_backend_name(c->backends[0]));
 
@@ -723,15 +910,25 @@ extern "C" PPDL_API ppdl_ctx * ppdl_init_ex(const char * model_path, int backend
 
     builder B;
     B.ctx = c->ctx0; B.m = &c->m; B.want_dumps = enable_dumps != 0;
+    B.gpu_convs = (backend == PPDL_BACKEND_CUDA);
     B.build(c->go, c->gf);
     fprintf(stderr, "ppdl: graph %d nodes\n", ggml_graph_n_nodes(c->gf));
 
+    // parallel=true: run the CPU split (topk300) concurrently with GPU splits
     c->sched = ggml_backend_sched_new(
-        c->backends.data(), nullptr, (int) c->backends.size(), GRAPH_NODES, false, true);
+        c->backends.data(), nullptr, (int) c->backends.size(), GRAPH_NODES, true, true);
     if (!ggml_backend_sched_alloc_graph(c->sched, c->gf)) {
         fprintf(stderr, "ppdl: sched alloc failed\n");
         ppdl_free(c);
         return nullptr;
+    }
+
+    c->profile = prof_enabled();
+    if (c->profile) {
+        c->prof.sched = c->sched;
+        c->prof.t0 = std::chrono::steady_clock::now();
+        ggml_backend_sched_set_eval_callback(c->sched, prof_cb, &c->prof);
+        fprintf(stderr, "ppdl: phase profiling enabled\n");
     }
 
     std::vector<float> pos, vm;
@@ -754,12 +951,14 @@ extern "C" PPDL_API int ppdl_infer(ppdl_ctx * c, const float * image_chw,
     ggml_backend_tensor_set(c->go.image, image_chw, 0, (size_t) 3 * IMG * IMG * 4);
 
     const auto t0 = std::chrono::steady_clock::now();
+    if (c->profile) c->prof.t0 = std::chrono::steady_clock::now();
     if (ggml_backend_sched_graph_compute(c->sched, c->gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ppdl: graph compute failed\n");
         return 2;
     }
     const auto t1 = std::chrono::steady_clock::now();
     c->computed = true;
+    if (c->profile) prof_report(c->prof);
 
     std::vector<float> logits((size_t) NQ * NC), boxes((size_t) NQ * 4);
     std::vector<float> order((size_t) NQ * NQ), maskl((size_t) NQ * MASK_PIX);
@@ -768,7 +967,8 @@ extern "C" PPDL_API int ppdl_infer(ppdl_ctx * c, const float * image_chw,
     ggml_backend_tensor_get(c->go.order,  order.data(),  0, order.size() * 4);
     ggml_backend_tensor_get(c->go.masks,  maskl.data(),  0, maskl.size() * 4);
 
-    postprocess(logits, boxes, order, maskl, ori_h, ori_w, c->out0, c->out2);
+    c->raw_logits = logits; c->raw_boxes = boxes; c->raw_order = order;
+    postprocess(logits, boxes, order, maskl, ori_h, ori_w, c->out0, c->out2, &c->raw_sel);
 
     result->dets     = c->out0.data();
     result->num_dets = NQ;
@@ -799,10 +999,22 @@ extern "C" PPDL_API int ppdl_dump(ppdl_ctx * c, const char * dir) {
     return 0;
 }
 
+extern "C" PPDL_API int ppdl_dump_raw(ppdl_ctx * c, const char * pfx) {
+    if (!c || !pfx) return 1;
+    if (!c->computed) { fprintf(stderr, "ppdl: no inference to dump\n"); return 1; }
+    write_file(std::string(pfx) + "logits.bin", c->raw_logits.data(), c->raw_logits.size() * 4);
+    write_file(std::string(pfx) + "boxes.bin",  c->raw_boxes.data(),  c->raw_boxes.size() * 4);
+    write_file(std::string(pfx) + "order.bin",  c->raw_order.data(),  c->raw_order.size() * 4);
+    write_file(std::string(pfx) + "sel.bin",    c->raw_sel.data(),    c->raw_sel.size() * 4);
+    return 0;
+}
+
 extern "C" PPDL_API void ppdl_free(ppdl_ctx * c) {
     if (!c) return;
     if (c->sched) ggml_backend_sched_free(c->sched);
     if (c->ctx0)  ggml_free(c->ctx0);
+    if (c->m.rbuf)  ggml_backend_buffer_free(c->m.rbuf);
+    if (c->m.ctx_r) ggml_free(c->m.ctx_r);
     if (c->m.wbuf)  ggml_backend_buffer_free(c->m.wbuf);
     if (c->m.gctx)  gguf_free(c->m.gctx);
     if (c->m.ctx_w) ggml_free(c->m.ctx_w);

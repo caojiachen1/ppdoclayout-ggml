@@ -11,6 +11,8 @@ option(USE_CUDA "build with CUDA backend" OFF)
 option(PPDL_DIST "self-contained distributable DLL: static ggml, portable CPU baseline" OFF)
 if(USE_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # whole-graph capture+replay: removes per-kernel launch overhead (~1700 nodes)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
 if(PPDL_DIST)
     set(BUILD_SHARED_LIBS OFF)
@@ -22,7 +24,8 @@ if(PPDL_DIST)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 endif()
 
-# init ggml submodule + apply FP32 parity patch (idempotent)
+# init ggml submodule + apply the ppdl patch (FP32 parity + GPU custom ops,
+# idempotent)
 find_package(Git QUIET)
 if(GIT_FOUND)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt")
@@ -30,17 +33,17 @@ if(GIT_FOUND)
                         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
     execute_process(COMMAND "${GIT_EXECUTABLE}" -C ggml apply --check
-                            "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fp32-parity.patch"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-ppdl.patch"
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                     RESULT_VARIABLE PPDL_PATCH_CHECK
                     ERROR_QUIET)
     if(PPDL_PATCH_CHECK EQUAL 0)
         execute_process(COMMAND "${GIT_EXECUTABLE}" -C ggml apply
-                                "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fp32-parity.patch"
+                                "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-ppdl.patch"
                         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-        message(STATUS "applied patches/ggml-fp32-parity.patch to ggml")
+        message(STATUS "applied patches/ggml-ppdl.patch to ggml")
     else()
-        message(STATUS "ggml FP32 parity patch already applied (or not applicable)")
+        message(STATUS "ggml ppdl patch already applied (or not applicable)")
     endif()
 endif()
 

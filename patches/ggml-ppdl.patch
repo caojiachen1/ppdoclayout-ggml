@@ -1,0 +1,427 @@
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 69d7ae80..8753d0ac 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1479,7 +1479,8 @@ struct ggml_backend_cuda_context {
+         if (cublas_handles[device] == nullptr) {
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
+-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
++            // patched for ppdoclayout: full FP32 GEMM required for ONNX parity (no TF32)
++            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_DEFAULT_MATH));
+         }
+         return cublas_handles[device];
+     }
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 4aaa4f36..7e50e863 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -67,6 +67,7 @@
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/fill.cuh"
+ #include "ggml-cuda/lightning-indexer.cuh"
++#include "ggml-cuda/ppdl-ops.cuh"
+ #include "ggml.h"
+ 
+ #include <algorithm>
+@@ -88,6 +89,7 @@
+ #include <cstdlib>
+ #include <string>
+ #include <vector>
++#include <chrono>
+ 
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+@@ -2350,6 +2352,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_LIGHTNING_INDEXER:
+             ggml_cuda_lightning_indexer(ctx, dst);
+             break;
++        case GGML_OP_CUSTOM: // patched for ppdoclayout: tagged custom ops run on GPU
++            if (!ggml_cuda_compute_forward_ppdl(ctx, dst)) {
++                return false;
++            }
++            break;
+         default:
+             return false;
+     }
+@@ -5122,6 +5129,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return true;
+         case GGML_OP_LIGHTNING_INDEXER:
+             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
++        case GGML_OP_CUSTOM: // patched for ppdoclayout: tagged custom ops on GPU
++            return ggml_cuda_supports_ppdl_op(op);
+ 
+         default:
+             return false;
+diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
+index 28c79ab4..6e953687 100644
+--- a/src/ggml-cuda/im2col.cu
++++ b/src/ggml-cuda/im2col.cu
+@@ -1,4 +1,5 @@
+ #include "im2col.cuh"
++#include "ggml-cuda/ppdl-ops.cuh"
+ 
+ #define MAX_GRIDDIM_Y 65535
+ #define MAX_GRIDDIM_Z 65535
+@@ -111,7 +112,11 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     if(dst->type == GGML_TYPE_F16) {
+         im2col_cuda_f16(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+     } else {
+-        im2col_cuda_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
++        // patched for ppdoclayout: coalesced F32 im2col (stock kernel is
++        // scheduling-bound for small IC*KH*KW); falls back if unsupported
++        if (!ggml_cuda_ppdl_im2col_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream)) {
++            im2col_cuda_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
++        }
+     }
+ }
+ 
+diff --git a/src/ggml-cuda/mmf.cu b/src/ggml-cuda/mmf.cu
+index 646a5899..ae10fc41 100644
+--- a/src/ggml-cuda/mmf.cu
++++ b/src/ggml-cuda/mmf.cu
+@@ -180,7 +180,8 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
+ 
+     switch (type) {
+         case GGML_TYPE_F32:
+-            return ampere_mma_available(cc) || amd_mfma_available(cc);
++            // patched for ppdoclayout: F32 mmf uses TF32 MMA which breaks ONNX parity
++            return false;
+         case GGML_TYPE_F16:
+             return volta_mma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
+         case GGML_TYPE_BF16:
+diff --git a/src/ggml-cuda/ppdl-ops.cu b/src/ggml-cuda/ppdl-ops.cu
+new file mode 100644
+index 00000000..27789c34
+--- /dev/null
++++ b/src/ggml-cuda/ppdl-ops.cu
+@@ -0,0 +1,316 @@
++// PP-DocLayoutV3 custom ops on CUDA (part of patches/ggml-fp32-parity.patch).
++//
++// The host code (ppdoclayout.cpp) tags its GGML_OP_CUSTOM tensors by writing
++//   op_params int32 slot 12 = PPDL_MAGIC, slot 13 = op id
++// The CPU callbacks remain the fallback for the CPU backend; when the graph
++// runs on CUDA these kernels take over so the sched never has to leave the
++// GPU mid-graph (which used to cost ~15 ms of stalls + transfers per image).
++//
++// Numerical contract: accumulation order matches the CPU reference loops
++// (l -> p -> k taps, FMA per tap), softmax/log use precise CUDA math
++// functions, so results agree with the CPU op to ~1e-7 — well inside the
++// ONNX-oracle tolerances used by the parity harness.
++
++#include "common.cuh"
++
++#include <cmath>
++
++#define PPDL_MAGIC      0x5050444Cu // "PPDL"
++#define PPDL_OP_MASKBOX 1
++#define PPDL_OP_MSDEF   2
++#define PPDL_OP_CONV    3 // decomposed conv: 1x1 or k3-s1 via batched cuBLAS GEMM
++
++#define PPDL_DM        256
++#define PPDL_NH        8
++#define PPDL_HD        32
++#define PPDL_NQ        300
++#define PPDL_MASK_HW   200
++#define PPDL_MASK_PIX  (PPDL_MASK_HW * PPDL_MASK_HW)
++
++static __device__ __forceinline__ float ppdl_invsig(float x) {
++    x = fminf(fmaxf(x, 0.0f), 1.0f);
++    float x1 = fmaxf(x, 1e-5f);
++    float x2 = fmaxf(1.0f - x, 1e-5f);
++    return logf(x1 / x2);
++}
++
++// dst (4,NQ); src0 mask logits (MASK_PIX, NQ), flat [q*MASK_PIX + y*HW + x]
++static __global__ void ppdl_mask_box_kernel(const float * __restrict__ ml,
++                                             float * __restrict__ out,
++                                             int nq) {
++    const int q = blockIdx.x;
++    if (q >= nq) return;
++    __shared__ int s_xmin, s_xmax, s_ymin, s_ymax;
++    if (threadIdx.x == 0) {
++        s_xmin = PPDL_MASK_HW; s_xmax = -1;
++        s_ymin = PPDL_MASK_HW; s_ymax = -1;
++    }
++    __syncthreads();
++
++    const float * m = ml + (size_t) q * PPDL_MASK_PIX;
++    for (int i = threadIdx.x; i < PPDL_MASK_PIX; i += blockDim.x) {
++        if (m[i] > 0.0f) {
++            const int y = i / PPDL_MASK_HW;
++            const int x = i - y * PPDL_MASK_HW;
++            atomicMin(&s_xmin, x);
++            atomicMax(&s_xmax, x);
++            atomicMin(&s_ymin, y);
++            atomicMax(&s_ymax, y);
++        }
++    }
++    __syncthreads();
++
++    if (threadIdx.x == 0) {
++        float bx0, by0, bx1, by1;
++        if (s_xmax < 0) {
++            bx0 = by0 = bx1 = by1 = 0.0f;
++        } else {
++            bx0 = (float) s_xmin; by0 = (float) s_ymin;
++            bx1 = (float) s_xmax + 1.0f; by1 = (float) s_ymax + 1.0f;
++        }
++        const float inv = 1.0f / (float) PPDL_MASK_HW;
++        bx0 *= inv; bx1 *= inv; by0 *= inv; by1 *= inv;
++        const float cx = (bx0 + bx1) * 0.5f, cy = (by0 + by1) * 0.5f;
++        const float bw = bx1 - bx0,           bh = by1 - by0;
++        float * o = out + (size_t) q * 4;
++        o[0] = ppdl_invsig(cx); o[1] = ppdl_invsig(cy);
++        o[2] = ppdl_invsig(bw); o[3] = ppdl_invsig(bh);
++    }
++}
++
++// one block per query, one warp per head: lane = channel within the head
++// src0 value (DM,13125) flat [t*DM + c]; src1 offs (192,NQ) [q*192+..]
++// src2 attn (96,NQ) [q*96+..]; src3 ref (4,NQ) [q*4+..]; dst (DM,NQ)
++static __global__ void ppdl_msdeform_kernel(
++        const float * __restrict__ val,
++        const float * __restrict__ off,
++        const float * __restrict__ awr,
++        const float * __restrict__ ref,
++        float * __restrict__ out,
++        int nq) {
++    static const int LVL_W[3]     = {100, 50, 25};
++    static const int LVL_H[3]     = {100, 50, 25};
++    static const int LVL_START[3] = {0, 10000, 12500};
++
++    const int q = blockIdx.x;
++    if (q >= nq) return;
++    const int h    = threadIdx.x >> 5; // warp = head
++    const int lane = threadIdx.x & 31;
++    if (h >= PPDL_NH || lane >= PPDL_HD) return;
++
++    const float * rq = ref + (size_t) q * 4;
++    float acc = 0.0f;
++
++    // softmax over the 12 (level, point) weights
++    const float * a = awr + (size_t) q * 96 + h * 12;
++    float amax = a[0];
++    for (int i = 1; i < 12; i++) amax = fmaxf(amax, a[i]);
++    float w[12], wsum = 0.0f;
++    for (int i = 0; i < 12; i++) { w[i] = expf(a[i] - amax); wsum += w[i]; }
++    for (int i = 0; i < 12; i++) w[i] /= wsum;
++
++    for (int l = 0; l < 3; l++) {
++        const int W = LVL_W[l], H = LVL_H[l], st = LVL_START[l];
++        for (int p = 0; p < 4; p++) {
++            const float ox = off[(size_t) q * 192 + (((h * 3 + l) * 4 + p) * 2 + 0)];
++            const float oy = off[(size_t) q * 192 + (((h * 3 + l) * 4 + p) * 2 + 1)];
++            const float lx = rq[0] + ox * 0.25f * rq[2] * 0.5f;
++            const float ly = rq[1] + oy * 0.25f * rq[3] * 0.5f;
++            const float fx = lx * W - 0.5f;
++            const float fy = ly * H - 0.5f;
++            const int   x0 = (int) floorf(fx), y0 = (int) floorf(fy);
++            const float tx = fx - x0, ty = fy - y0;
++            const float wt = w[l * 4 + p];
++            const float cw[4] = {
++                (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
++            const int xs[4] = { x0, x0 + 1, x0, x0 + 1 };
++            const int ys[4] = { y0, y0, y0 + 1, y0 + 1 };
++            for (int k = 0; k < 4; k++) {
++                const int xx = xs[k], yy = ys[k];
++                if (xx < 0 || xx >= W || yy < 0 || yy >= H || cw[k] == 0.0f) continue;
++                const float * v = val + ((size_t) (st + yy * W + xx) * PPDL_DM) + h * PPDL_HD;
++                const float ww = wt * cw[k];
++                acc = fmaf(ww, v[lane], acc);
++            }
++        }
++    }
++    out[(size_t) q * PPDL_DM + h * PPDL_HD + lane] = acc;
++}
++
++bool ggml_cuda_compute_forward_ppdl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    const int32_t * p = (const int32_t *) dst->op_params;
++    cudaStream_t stream = ctx.stream();
++    const ggml_tensor * s0 = dst->src[0];
++
++    switch (p[13]) {
++        case PPDL_OP_MASKBOX: {
++            GGML_ASSERT(dst->ne[0] == 4 && s0->ne[0] == PPDL_MASK_PIX);
++            ppdl_mask_box_kernel<<<dst->ne[1], 256, 0, stream>>>(
++                (const float *) s0->data, (float *) dst->data, (int) dst->ne[1]);
++        } break;
++        case PPDL_OP_MSDEF: {
++            GGML_ASSERT(dst->ne[0] == PPDL_DM && dst->ne[1] == PPDL_NQ);
++            ppdl_msdeform_kernel<<<(int) dst->ne[1], PPDL_NH * 32, 0, stream>>>(
++                (const float *) s0->data,
++                (const float *) dst->src[1]->data,
++                (const float *) dst->src[2]->data,
++                (const float *) dst->src[3]->data,
++                (float *) dst->data, (int) dst->ne[1]);
++        } break;
++        case PPDL_OP_CONV: {
++            // srcs: x (IW,IH,IC,1) F32 CHW-contiguous, w2 repacked (K*K, IC, OC)
++            // row-major, b (OC,). params: [14] = K | (pad<<8), [15] = layout flag:
++            // 0 -> dst ne (OW,OH,OC) CHW (k1 path); 1 -> dst ne (OC,OW,OH) with
++            // channel-last data, converted by a builder-side permute+cont (k3 path).
++            const ggml_tensor * x = s0;
++            const ggml_tensor * w = dst->src[1];
++            const ggml_tensor * b = dst->src[2]; (void) b;
++            const int K    = p[14] & 0xFF;
++            const int pad  = (p[14] >> 8) & 0xFF;
++            const int cmaj = p[15];
++            const int64_t IW = x->ne[0], IH = x->ne[1], IC = x->ne[2];
++            const int64_t OW = cmaj ? dst->ne[1] : dst->ne[0];
++            const int64_t OH = cmaj ? dst->ne[2] : dst->ne[1];
++            const int64_t OC = cmaj ? dst->ne[0] : dst->ne[2];
++            GGML_ASSERT(K == 1 || K == 3);
++            GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w));
++
++            float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
++            cublasHandle_t h = ctx.cublas_handle();
++            CUBLAS_CHECK(cublasSetStream(h, stream));
++            // TF32 off: full FP32 GEMM (parity requirement)
++            CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
++
++            if (K == 1) {
++                // ggml tensors are CHW: x buffer is (IC,P) row-major and dst is
++                // (OC,P) row-major. cuBLAS col-major equivalent:
++                //   C(p,oc) at oc*P + p, A(p,ic) = x[ic*P+p] (OP_N, lda=P),
++                //   B(ic,oc) = w2[ic*OC+oc] (OP_T, ldb=OC).
++                CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_T,
++                        (int) (OW * OH), (int) OC, (int) IC,
++                        &alpha, (const float *) x->data, (int) (IH * IW),
++                                (const float *) w->data, (int) OC,
++                        &beta0, (float *) dst->data, (int) (OW * OH)));
++            } else {
++                // k3 s1: x pre-padded by the caller, w2 (9, IC, OC) row-major.
++                // Per tap t: batched GEMM over OH output rows accumulating into
++                // the channel-last dst buffer (p*OC + oc): C_batch (OC,OW)
++                // col-major, ldc=OC, batch stride OW*OC.
++                const float * w2 = (const float *) w->data;
++                for (int t = 0; t < 9; t++) {
++                    const int kh = t / 3, kw = t % 3;
++                    const float * wt = w2 + (size_t) t * IC * OC;
++                    const long long row0 = (long long) kh * IW + kw;
++                    const float * xb = (const float *) x->data + row0;
++                    CUBLAS_CHECK(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T,
++                            (int) OC, (int) OW, (int) IC,
++                            &alpha, wt, (int) OC, 0,
++                                   xb, (int) (IH * IW), (int) IW,
++                            t == 0 ? &beta0 : &beta1,
++                                   (float *) dst->data, (int) OC, (long long) OW * OC,
++                            (int) OH));
++                }
++            }
++            (void) pad;
++        } break;
++        default:
++            return false;
++    }
++    return true;
++}
++
++// ---- optimized F32 im2col (patched for ppdoclayout) ------------------------
++// ggml's stock kernel launches one (ic*kh*kw)-thread block per output pixel,
++// which for k=3 stems means 160k blocks of 27 threads — scheduling bound.
++// Two replacements, both pure data movement (bitwise identical):
++//   1x1/s1/p0 convs -> tiled shared-memory transpose (most backbone volume)
++//   otherwise       -> warp-per-(pixel, k-chunk): coalesced dst writes
++
++#define PPDL_TP 32
++
++static __global__ void ppdl_transpose_kernel(const float * __restrict__ x,
++                                             float * __restrict__ dst,
++                                             int IC, int64_t P) {
++    // x[ic * P + p] -> dst[p * IC + ic], 32x32 tiles through smem
++    __shared__ float tile[PPDL_TP][PPDL_TP + 1];
++    const int64_t ic0 = (int64_t) blockIdx.y * PPDL_TP;
++    const int64_t p0  = (int64_t) blockIdx.x * PPDL_TP;
++    const int tic = threadIdx.x, tp = threadIdx.y;
++
++    int64_t ic = ic0 + tic, p = p0 + tp;
++    if (ic < IC && p < P) tile[tp][tic] = x[ic * P + p];
++    __syncthreads();
++
++    ic = ic0 + threadIdx.y; p = p0 + threadIdx.x;
++    if (ic < IC && p < P) dst[p * IC + ic] = tile[threadIdx.x][threadIdx.y];
++}
++
++static __global__ void ppdl_im2col_warp_kernel(
++        const float * __restrict__ x, float * __restrict__ dst,
++        int64_t IW, int64_t IH, int64_t OW, int64_t OH,
++        int64_t KW, int64_t KH, int64_t IC,
++        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH,
++        int s0, int s1, int p0, int p1, int d0, int d1) {
++    const int64_t KH_KW   = KH * KW;
++    const int64_t IC_KH_KW = IC * KH_KW;
++    const int kchunks = (int) ((IC_KH_KW + 31) / 32);
++
++    const int64_t w  = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
++    const int   lane = threadIdx.x & 31;
++    const int64_t npix = (int64_t) OW * N_OH;
++    if (w >= npix * kchunks) return;
++
++    const int64_t pix = w / kchunks;
++    const int   kc   = (int) (w - pix * kchunks);
++    const int64_t k  = (int64_t) kc * 32 + lane;
++    if (k >= IC_KH_KW) return;
++
++    const int64_t iic = k / KH_KW;
++    const int64_t rem = k - iic * KH_KW;
++    const int64_t ikh = rem / KW;
++    const int64_t ikw = rem - ikh * KW;
++
++    const int64_t iow = pix % OW;
++    const int64_t iz  = pix / OW;
++    const int64_t in  = iz / OH;
++    const int64_t ioh = iz - in * OH;
++
++    const int64_t iiw = iow * s0 + ikw * d0 - p0;
++    const int64_t iih = ioh * s1 + ikh * d1 - p1;
++
++    float v = 0.0f;
++    if (iih >= 0 && iih < IH && iiw >= 0 && iiw < IW) {
++        v = x[iic * IC_IH_IW + in * IH_IW + iih * IW + iiw];
++    }
++    dst[pix * IC_KH_KW + k] = v;
++}
++
++bool ggml_cuda_ppdl_im2col_f32(const float * x, float * dst,
++    int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
++    int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
++    int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream) {
++    const int64_t P = N * OH * OW;
++    if (KW == 1 && KH == 1 && s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0 && d0 == 1 && d1 == 1) {
++        if (IC_IH_IW != P) return false; // not a plain channel-last layout
++        dim3 grid((unsigned) ((P + PPDL_TP - 1) / PPDL_TP),
++                  (unsigned) ((IC + PPDL_TP - 1) / PPDL_TP));
++        ppdl_transpose_kernel<<<grid, dim3(PPDL_TP, PPDL_TP), 0, stream>>>(x, dst, (int) IC, P);
++        return true;
++    }
++    const int64_t npix = OW * (N * OH);
++    const int64_t kchunks = (IC * KW * KH + 31) / 32;
++    const int64_t nwarps = npix * kchunks;
++    const int warps_per_block = 8;
++    dim3 grid((unsigned) ((nwarps + warps_per_block - 1) / warps_per_block));
++    ppdl_im2col_warp_kernel<<<grid, warps_per_block * 32, 0, stream>>>(
++        x, dst, IW, IH, OW, OH, KW, KH, IC, IC_IH_IW, IH_IW, N * OH,
++        s0, s1, p0, p1, d0, d1);
++    return true;
++}
++
++bool ggml_cuda_supports_ppdl_op(const struct ggml_tensor * op) {
++    if (op->op != GGML_OP_CUSTOM) return false;
++    const int32_t * p = (const int32_t *) op->op_params;
++    return p[12] == PPDL_MAGIC &&
++           (p[13] == PPDL_OP_MASKBOX || p[13] == PPDL_OP_MSDEF || p[13] == PPDL_OP_CONV);
++}
+diff --git a/src/ggml-cuda/ppdl-ops.cuh b/src/ggml-cuda/ppdl-ops.cuh
+new file mode 100644
+index 00000000..ca50bd89
+--- /dev/null
++++ b/src/ggml-cuda/ppdl-ops.cuh
+@@ -0,0 +1,7 @@
++// PP-DocLayoutV3 tagged custom ops (patched for ppdoclayout, see ppdl-ops.cu)
++bool ggml_cuda_compute_forward_ppdl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
++bool ggml_cuda_supports_ppdl_op(const struct ggml_tensor * op);
++bool ggml_cuda_ppdl_im2col_f32(const float * x, float * dst,
++    int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
++    int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
++    int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream);

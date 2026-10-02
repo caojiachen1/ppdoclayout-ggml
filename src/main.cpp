@@ -32,11 +32,15 @@ static bool write_file(const std::string & path, const void * src, size_t nbytes
     return wr == nbytes;
 }
 
+// micro benchmark: one k3 conv (IC 192 -> OC 128 at 200x200) through the exact
+// graph shape the model builder uses: F32 im2col -> mul_mat -> permute -> cont
+
 int main(int argc, char ** argv) {
     const char * model_path = "model-f32.gguf";
     const char * input_path = nullptr;
     const char * out_dir    = ".";
     const char * dump_dir   = nullptr;
+    const char * dump_raw_pfx = nullptr;
     std::string  backend_name = "cpu";
     int ori_h = PPDL_IMG_SIZE, ori_w = PPDL_IMG_SIZE;
     int bench = 0;
@@ -55,9 +59,10 @@ int main(int argc, char ** argv) {
         else if (a == "--backend")   backend_name = next();
         else if (a == "--bench")     bench       = atoi(next());
         else if (a == "--dump-dir")  dump_dir    = next();
+        else if (a == "--dump-raw") dump_raw_pfx = next();
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
-    if (!input_path) { fprintf(stderr, "usage: ppdoclayout -m model.gguf -i input.bin --ori-h H --ori-w W -o outdir [--backend cpu|cuda] [--bench N] [--dump-dir d]\n"); return 1; }
+    if (!input_path) { fprintf(stderr, "usage: ppdoclayout -m model.gguf -i input.bin --ori-h H --ori-w W -o outdir [--backend cpu|cuda] [--bench N] [--dump-dir d] [--dump-raw pfx]\n"); return 1; }
 
     const int backend = backend_name == "cuda" ? PPDL_BACKEND_CUDA : PPDL_BACKEND_CPU;
     ppdl_ctx * ctx = ppdl_init_ex(model_path, backend, dump_dir != nullptr);
@@ -86,6 +91,7 @@ int main(int argc, char ** argv) {
     }
 
     if (dump_dir) ppdl_dump(ctx, dump_dir);
+    if (dump_raw_pfx) ppdl_dump_raw(ctx, dump_raw_pfx);
 
     const int32_t out1 = res.num_dets;
     MKDIR(out_dir);

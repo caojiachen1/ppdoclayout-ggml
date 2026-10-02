@@ -1,6 +1,6 @@
 # ppdoclayout-ggml
 
-[PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3) document layout analysis inference in pure C++ with [ggml](https://github.com/ggml-org/ggml). CPU and CUDA backends, bit-aligned with the official ONNX export (identical labels, score diff < 1e-6, box diff 0 px, mask IoU ≈ 1.0).
+[PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3) document layout analysis inference in pure C++ with [ggml](https://github.com/ggml-org/ggml). CPU and CUDA backends, aligned with the official ONNX export on a multi-PDF oracle (identical labels / reading order / selected top-300, score diff < 3e-6, box diff <= 0.001 px, mask IoU ~ 1.0 for every confident detection — see `bench/`).
 
 Detects 25 layout element classes (text, title, table, formula, image, ...) with boxes, instance masks and reading order.
 
@@ -10,6 +10,11 @@ Detects 25 layout element classes (text, title, table, formula, image, ...) with
 - C API (`ppdoclayout_c` shared library) + CLI + safe Rust crate
 - CPU and CUDA (RTX 20 through RTX 50 / Blackwell) via `ggml_backend_sched`
 - FP32 numerical parity with ONNX Runtime, including on GPU (TF32 disabled via a vendored ggml patch, applied automatically at configure time)
+- CUDA path: whole-graph capture/replay, deformable attention + mask-box ops as
+  GPU kernels, and 1x1 / 3x3-stride1 convs decomposed into batched cuBLAS GEMMs
+  (weights repacked at load; no im2col materialization, no layout transposes)
+- Multi-page oracle harness (`bench/`) against the Paddle2ONNX export that
+  [xDoc](https://github.com/caojiachen1/xDoc) ships
 
 ## Build
 
@@ -28,7 +33,9 @@ cmake -S . -B build-cuda -DUSE_CUDA=ON
 cmake --build build-cuda --config Release -j
 ```
 
-The first configure initializes the ggml submodule and applies the FP32 parity patch automatically.
+The first configure initializes the ggml submodule and applies the
+`patches/ggml-ppdl.patch` (FP32 parity + tagged custom-op GPU support)
+automatically.
 
 ## Get the model
 
@@ -68,13 +75,32 @@ Full API reference: [docs/API.en.md](docs/API.en.md) ([中文](docs/API.md)).
 
 ## Performance
 
-800×800 input, single image (RTX 4060 / i7, Windows):
+800×800 input, single image, steady state (`--bench`, warm graph):
 
 | Runtime | Latency |
 |---|---|
-| onnxruntime (CPU) | ~850 ms |
-| ggml (CPU) | ~2100 ms |
-| ggml (CUDA) | ~100 ms |
+| onnxruntime 1.30 (CPU, 24T) | 300 – 550 ms |
+| ggml (CPU) | ~1600 ms |
+| ggml (CUDA, RTX 5080) | **~18 ms** |
+| ggml (CUDA, RTX 4060, before the 2026-10 optimization round) | ~100 ms |
+
+CUDA notes: `GGML_CUDA_GRAPHS` is forced on for `USE_CUDA` builds (removes
+per-kernel launch overhead for the ~1300-node graph). The remaining wall time
+is dominated by the backbone's memory traffic; numerics stay FP32 throughout
+(TF32 off), so oracle parity is preserved.
+
+## Correctness
+
+`bench/` holds the oracle harness: 12 pages from 6 PDFs (EN papers, ZH slides,
+formula-heavy proofs, ZH reports) are pushed through both this library and the
+Paddle2ONNX export with identical input tensors. Acceptance: every detection
+above score 0.3 matches exactly (label, reading order, boxes to 0.05 px,
+masks to IoU 0.999) and the selected top-300 sets are equal.
+
+2026-10 fix: the reading-order head previously consumed the `dec_norm` output;
+it must consume the final decoder hidden state *before* that norm (as in the
+ONNX graph). Before this fix reading-order ranks diverged from ONNX on most
+pages; they are now exact for all confident detections.
 
 ## License
 

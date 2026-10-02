@@ -29,3 +29,12 @@ reference/
 .idea/
 Thumbs.db
 .DS_Store
+
+# bench harness: corpus + generated inputs/oracle are large
+bench/corpus/
+bench/inputs/
+bench/oracle/
+bench/ggml_out/
+__pycache__/
+bench/dv/
+bench/smoke/

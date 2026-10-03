@@ -1,22 +1,27 @@
 diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
-index 69d7ae80..8753d0ac 100644
+index 2e78ae4f..61df8865 100644
 --- a/src/ggml-cuda/common.cuh
 +++ b/src/ggml-cuda/common.cuh
-@@ -1479,7 +1479,8 @@ struct ggml_backend_cuda_context {
-         if (cublas_handles[device] == nullptr) {
+@@ -1537,11 +1537,13 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
+ 
++
+     cublasHandle_t cublas_handle() {
+         if (cublas_handles[device][curr_stream_no] == nullptr) {
              ggml_cuda_set_device(device);
-             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
--            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
 +            // patched for ppdoclayout: full FP32 GEMM required for ONNX parity (no TF32)
-+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_DEFAULT_MATH));
-         }
-         return cublas_handles[device];
-     }
++            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_DEFAULT_MATH));
+             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+             if (cublas_workspace_sizes[device] == 0) {
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 4aaa4f36..7e50e863 100644
+index 9dd34c86..c5546660 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -67,6 +67,7 @@
+@@ -70,6 +70,7 @@
  #include "ggml-cuda/cumsum.cuh"
  #include "ggml-cuda/fill.cuh"
  #include "ggml-cuda/lightning-indexer.cuh"
@@ -24,7 +29,7 @@ index 4aaa4f36..7e50e863 100644
  #include "ggml.h"
  
  #include <algorithm>
-@@ -88,6 +89,7 @@
+@@ -91,6 +92,7 @@
  #include <cstdlib>
  #include <string>
  #include <vector>
@@ -32,7 +37,7 @@ index 4aaa4f36..7e50e863 100644
  
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
-@@ -2350,6 +2352,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2416,6 +2418,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_LIGHTNING_INDEXER:
              ggml_cuda_lightning_indexer(ctx, dst);
              break;
@@ -44,7 +49,7 @@ index 4aaa4f36..7e50e863 100644
          default:
              return false;
      }
-@@ -5122,6 +5129,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5592,6 +5599,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return true;
          case GGML_OP_LIGHTNING_INDEXER:
              return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
@@ -54,7 +59,7 @@ index 4aaa4f36..7e50e863 100644
          default:
              return false;
 diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
-index 28c79ab4..6e953687 100644
+index d377f285..4e8c3c24 100644
 --- a/src/ggml-cuda/im2col.cu
 +++ b/src/ggml-cuda/im2col.cu
 @@ -1,4 +1,5 @@
@@ -63,7 +68,7 @@ index 28c79ab4..6e953687 100644
  
  #define MAX_GRIDDIM_Y 65535
  #define MAX_GRIDDIM_Z 65535
-@@ -111,7 +112,11 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -114,7 +115,11 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      if(dst->type == GGML_TYPE_F16) {
          im2col_cuda_f16(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
      } else {

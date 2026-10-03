@@ -46,3 +46,5 @@ bench/dbgpage.bin
 bench/results.jsonl
 bench/seen_thumbs.json
 bench/scratch/
+bench/results.jsonl.ggml017
+bench/seen_thumbs.json.ggml017

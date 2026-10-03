@@ -245,9 +245,9 @@ static bool load_model(model & m, const char * path, ggml_backend_t backend) {
     return true;
 }
 
-// Repack every qualifying conv weight (KW=KH in {1,3}, IC>1) from
+// Repack every qualifying conv weight (KW=KH in {1,2,3}, IC>1) from
 // (KW,KH,IC,OC) to (KW*KH, IC, OC) row-major, as "<name>.wr".
-// The custom conv op consumes this layout directly as per-tap GEMM operands.
+// Consumed by the GEMM-decomposed k1 op and the fused direct-conv kernel.
 static void repack_convs(model & m, ggml_backend_t dev) {
     const int64_t n = gguf_get_n_tensors(m.gctx);
     const size_t meta = 4 * 1024 * 1024 + (size_t) n * ggml_tensor_overhead();
@@ -264,7 +264,7 @@ static void repack_convs(model & m, ggml_backend_t dev) {
         if (nm.size() < 7 || nm.substr(nm.size() - 7) != ".weight") continue;
         ggml_tensor * t = ggml_get_tensor(m.ctx_w, name);
         if (t->ne[3] <= 1 || t->ne[2] <= 1) continue;         // 4D real conv only
-        if (t->ne[0] != t->ne[1] || (t->ne[0] != 1 && t->ne[0] != 3)) continue;
+        if (t->ne[0] != t->ne[1] || t->ne[0] < 1 || t->ne[0] > 3) continue;
         const int64_t KW = t->ne[0], IC = t->ne[2], OC = t->ne[3];
         const size_t nelem = (size_t) KW * KW * IC * OC;
         src.resize(nelem);
@@ -281,6 +281,61 @@ static void repack_convs(model & m, ggml_backend_t dev) {
         ggml_tensor * rt = ggml_new_tensor_3d(m.ctx_r, GGML_TYPE_F32, OC, IC, KW * KW);
         ggml_set_name(rt, (nm.substr(0, nm.size() - 7) + ".wr").c_str());
         todo.push_back({rt, std::move(rp)});
+
+        if (KW == 3) {
+            // Winograd F(2,3) filter transform: wg[u*4+v][ic][oc] =
+            // sum_{a,b} G[u][a] g[a][b][ic][oc] G[v][b]
+            static const float WG[4][3] = {
+                { 2.146311759948731f,  0.933696150779724f,  0.406179785728455f},
+                {-1.755281925201416f,  1.310971140861511f, -0.979127824306488f},
+                { 1.023769974708557f,  1.312750458717346f,  1.683301687240601f},
+                { 0.915698945522308f, -2.015886306762695f,  4.437918186187744f},
+            };
+            std::vector<float> wg((size_t) 16 * IC * OC);
+            for (int u = 0; u < 4; u++)
+                for (int v = 0; v < 4; v++)
+                    for (int ic = 0; ic < IC; ic++)
+                        for (int oc = 0; oc < OC; oc++) {
+                            float s = 0.0f;
+                            for (int a = 0; a < 3; a++)
+                                for (int b = 0; b < 3; b++) {
+                                    const size_t sidx =
+                                        (((size_t) oc * IC + ic) * 3 + a) * 3 + b;
+                                    s += WG[u][a] * WG[v][b] * src[sidx];
+                                }
+                            wg[((size_t) (u * 4 + v) * IC + ic) * OC + oc] = s;
+                        }
+            ggml_tensor * wt = ggml_new_tensor_3d(m.ctx_r, GGML_TYPE_F32, OC, IC, 16);
+            ggml_set_name(wt, (nm.substr(0, nm.size() - 7) + ".wg").c_str());
+            todo.push_back({wt, std::move(wg)});
+
+            // F(4,3) filter transform: 36 planes
+            static const float G4[6][3] = {
+                {-0.019582119f, -0.133662105f, -0.912340343f},
+                { 0.650278211f,  0.720138848f,  0.797504783f},
+                {-0.947692990f,  0.466171294f, -0.229310215f},
+                { 0.060792211f, -0.344588995f,  1.953236461f},
+                { 0.647394836f,  0.272543609f,  0.114736818f},
+                {-0.911203325f,  0.880876958f, -0.851559937f},
+            };
+            std::vector<float> wg4((size_t) 36 * IC * OC);
+            for (int u = 0; u < 6; u++)
+                for (int v = 0; v < 6; v++)
+                    for (int ic = 0; ic < IC; ic++)
+                        for (int oc = 0; oc < OC; oc++) {
+                            float s = 0.0f;
+                            for (int a = 0; a < 3; a++)
+                                for (int b = 0; b < 3; b++) {
+                                    const size_t sidx =
+                                        (((size_t) oc * IC + ic) * 3 + a) * 3 + b;
+                                    s += G4[u][a] * G4[v][b] * src[sidx];
+                                }
+                            wg4[((size_t) (u * 6 + v) * IC + ic) * OC + oc] = s;
+                        }
+            ggml_tensor * w4t = ggml_new_tensor_3d(m.ctx_r, GGML_TYPE_F32, OC, IC, 36);
+            ggml_set_name(w4t, (nm.substr(0, nm.size() - 7) + ".wg4").c_str());
+            todo.push_back({w4t, std::move(wg4)});
+        }
     }
 
     m.rbuf = ggml_backend_alloc_ctx_tensors(m.ctx_r, dev);
@@ -311,6 +366,9 @@ struct builder {
     graph_out    * out;
     bool           want_dumps;
     bool           gpu_convs = false; // use the tagged custom conv op (CUDA only)
+    int            stop_after = 0;    // PPDL_STOP: 0=full; 1=backbone; 2=+encoder;
+                                     // 3=+source; 4=+decoder; 5..9=backbone stages; 10..12=stem
+    ggml_tensor  * trunc_t = nullptr; // interior truncation hook
 
     void dump(const char * name, ggml_tensor * t) {
         if (!want_dumps) return;
@@ -331,34 +389,137 @@ struct builder {
         ggml_tensor * w = m->get(name + ".weight");
         ggml_tensor * b = m->get(name + ".bias");
         ggml_tensor * r;
-        // stride-1 1x1 / 3x3 convs run as the tagged custom op: batched cuBLAS
-        // GEMMs over strided input views (no im2col materialization, no layout
-        // transposes). Requires the ".wr" repacked weights from repack_convs().
-        static const int conv_mode = [] { // debug bisect: 1=k1 only, 2=k3 only, 3=both
+        // path select (debug bisect): bit1=k1 GEMM, bit2=k3 GEMM-decomp,
+        // bit4=direct fused kernel (k2/k3 any stride), bit8=fused bias+act for k1,
+        // bit16=Winograd F(2,3), bit32=Winograd F(4,3) (k3 s1 p1)
+        static const int conv_mode = [] {
             const char * e = getenv("PPDL_CONV_MODE");
-            return e ? atoi(e) : 3;
+            return e ? atoi(e) : 1 | 2 | 8 | 32;
         }();
-        const bool want_k1 = w->ne[0] == 1 && (conv_mode & 1);
-        const bool want_k3 = w->ne[0] == 3 && p <= 1 && (conv_mode & 2);
-        if (gpu_convs && s == 1 && w->ne[0] == w->ne[1] && (want_k1 || want_k3) &&
-            !(w->ne[2] == 1 && x->ne[2] != 1)) { // not depthwise
-            ggml_tensor * xin = x;
-            if (w->ne[0] == 3 && p == 1) {
-                xin = ggml_pad_ext(ctx, x, 1, 1, 1, 1, 0, 0, 0, 0);
+
+        if (w->ne[2] == 1 && x->ne[2] != 1) { // depthwise
+            r = ggml_conv_2d_dw_direct(ctx, w, x, s, s, p, p, 1, 1);
+            r = ggml_add(ctx, r, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
+            return act(r, a);
+        }
+
+        if (gpu_convs && w->ne[0] == w->ne[1] && w->ne[2] > 1) {
+            const int K = (int) w->ne[0];
+            if (K == 1 && s == 1 && p == 0 && (conv_mode & 1)) {
+                // 1x1 = one cuBLAS GEMM writing CHW (OW,OH,OC) directly
+                ggml_tensor * cargs[3] = { x, m->get(name + ".wr"), b };
+                ggml_tensor * g = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], w->ne[3], 1,
+                                                 cargs, 3, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(g, 3);
+                g->op_params[14] = 1 | (p << 8);
+                g->op_params[15] = 0;
+                if (conv_mode & 8) { // bias + activation fused into one pass
+                    ggml_tensor * cargs2[2] = { g, b };
+                    ggml_tensor * r2 = ggml_custom_4d(ctx, GGML_TYPE_F32, g->ne[0], g->ne[1], g->ne[2], 1,
+                                                      cargs2, 2, op_conv_unsupported, 1, nullptr);
+                    tag_custom_op(r2, 5);
+                    r2->op_params[14] = (int) a;
+                    return r2;
+                }
+                r = ggml_add(ctx, g, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
+                return act(r, a);
             }
-            const int64_t OW = xin->ne[0] - w->ne[0] + 1;
-            const int64_t OH = xin->ne[1] - w->ne[1] + 1;
-            ggml_tensor * cargs[3] = { xin, m->get(name + ".wr"), b };
-            if (w->ne[0] == 1) {
-                // k1 GEMM writes straight into a CHW (OW,OH,OC) tensor
+            const bool dir_ok =
+                (K == 3 && s == 1 && p == 1) || (K == 3 && s == 2 && p == 1) ||
+                (K == 2 && s == 1 && p == 0) || (K == 1 && s == 1 && p == 0);
+            if ((conv_mode & 32) && K == 3 && s == 1 && p == 1) {
+                // Winograd F(4,3): 6x6 input tiles -> 4x4 output tiles, 36 planes
+                const int64_t OW_t = (x->ne[0] + 3) / 4;
+                const int64_t OH_t = (x->ne[1] + 3) / 4;
+                const int64_t IW_p = 4 * OW_t + 2, IH_p = 4 * OH_t + 2;
+                ggml_tensor * xp = x;
+                if (x->ne[0] + 1 != IW_p || x->ne[1] + 1 != IH_p) {
+                    xp = ggml_pad_ext(ctx, x, 1, IW_p - x->ne[0] - 1,
+                                      1, IH_p - x->ne[1] - 1, 0, 0, 0, 0);
+                }
+                const int64_t T = OW_t * OH_t;
+                ggml_tensor * ca1[1] = { xp };
+                ggml_tensor * dt = ggml_custom_4d(ctx, GGML_TYPE_F32, T, x->ne[2], 36, 1,
+                                                  ca1, 1, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(dt, 10);
+                dt->op_params[14] = (int) T;
+                dt->op_params[15] = (int) OH_t;
+                ggml_tensor * ca2[2] = { dt, m->get(name + ".wg4") };
+                ggml_tensor * yt = ggml_custom_4d(ctx, GGML_TYPE_F32, T, w->ne[3], 36, 1,
+                                                  ca2, 2, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(yt, 12);
+                ggml_tensor * ca3[2] = { yt, b };
+                ggml_tensor * r = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], w->ne[3], 1,
+                                                 ca3, 2, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(r, 11);
+                r->op_params[14] = (int) a;
+                r->op_params[15] = (int) OW_t;
+                if (want_dumps && name == "st0.b0.l0") {
+                    dump("wg_xp", xp);
+                    dump("wg_dt", dt);
+                    dump("wg_yt", yt);
+                    dump("wg_r", r);
+                }
+                return r;
+            }
+            if ((conv_mode & 16) && K == 3 && s == 1 && p == 1) {
+                // Winograd F(2,3): pad to the 2x2-output tile grid (left/top pad
+                // is the conv's own p=1; right/bottom completes the tile grid),
+                // then input transform -> 16-plane batched GEMM -> output transform
+                const int64_t OW_t = (x->ne[0] + 1) / 2;
+                const int64_t OH_t = (x->ne[1] + 1) / 2;
+                const int64_t IW_p = 2 * OW_t + 2, IH_p = 2 * OH_t + 2;
+                ggml_tensor * xp = x;
+                if (x->ne[0] + 1 != IW_p || x->ne[1] + 1 != IH_p) {
+                    xp = ggml_pad_ext(ctx, x, 1, IW_p - x->ne[0] - 1,
+                                      1, IH_p - x->ne[1] - 1, 0, 0, 0, 0);
+                }
+                const int64_t T = OW_t * OH_t;
+                ggml_tensor * ca1[1] = { xp };
+                ggml_tensor * dt = ggml_custom_4d(ctx, GGML_TYPE_F32, T, x->ne[2], 16, 1,
+                                                  ca1, 1, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(dt, 7);
+                dt->op_params[14] = (int) T;      // total tile count
+                dt->op_params[15] = (int) OH_t;   // TH (TW = T/TH)
+                ggml_tensor * ca2[2] = { dt, m->get(name + ".wg") };
+                ggml_tensor * yt = ggml_custom_4d(ctx, GGML_TYPE_F32, T, w->ne[3], 16, 1,
+                                                  ca2, 2, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(yt, 9);
+                ggml_tensor * ca3[2] = { yt, b };
+                ggml_tensor * r = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], w->ne[3], 1,
+                                                 ca3, 2, op_conv_unsupported, 1, nullptr);
+                tag_custom_op(r, 8);
+                r->op_params[14] = (int) a;
+                r->op_params[15] = (int) OW_t;
+                if (want_dumps && name == "st0.b0.l0") {
+                    dump("wg_xp", xp);
+                    dump("wg_dt", dt);
+                    dump("wg_yt", yt);
+                    dump("wg_r", r);
+                }
+                return r;
+            }
+            if ((conv_mode & 4) && dir_ok) {
+                // fused direct conv kernel: one pass, no im2col/pad/permute/cont
+                const int64_t OW = (x->ne[0] + 2 * p - K) / s + 1;
+                const int64_t OH = (x->ne[1] + 2 * p - K) / s + 1;
+                ggml_tensor * cargs[3] = { x, m->get(name + ".wr"), b };
                 r = ggml_custom_4d(ctx, GGML_TYPE_F32, OW, OH, w->ne[3], 1,
                                    cargs, 3, op_conv_unsupported, 1, nullptr);
-                tag_custom_op(r, 3);
-                r->op_params[14] = 1 | (p << 8);
-                r->op_params[15] = 0;
-            } else {
-                // k3 writes channel-last data under a (OC,OW,OH) ne convention;
+                tag_custom_op(r, 4);
+                r->op_params[14] = K | (s << 8) | (p << 16) | ((int) a << 24);
+                return r;
+            }
+            if (K == 3 && s == 1 && p <= 1 && (conv_mode & 2)) {
+                // legacy: k3 GEMM-decomposed, channel-last under (OC,OW,OH) ne;
                 // permute+cont turns it into the CHW (OW,OH,OC) everyone expects
+                ggml_tensor * xin = x;
+                if (p == 1) {
+                    xin = ggml_pad_ext(ctx, x, 1, 1, 1, 1, 0, 0, 0, 0);
+                }
+                const int64_t OW = xin->ne[0] - 2;
+                const int64_t OH = xin->ne[1] - 2;
+                ggml_tensor * cargs[3] = { xin, m->get(name + ".wr"), b };
                 r = ggml_custom_4d(ctx, GGML_TYPE_F32, w->ne[3], OW, OH, 1,
                                    cargs, 3, op_conv_unsupported, 1, nullptr);
                 tag_custom_op(r, 3);
@@ -367,20 +528,16 @@ struct builder {
                 // source axis order (OC, OW, OH) -> logical (OW, OH, OC):
                 // ggml_permute dims say where each SOURCE axis goes
                 r = ggml_cont(ctx, ggml_permute(ctx, r, 2, 0, 1, 3));
+                r = ggml_add(ctx, r, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
+                return act(r, a);
             }
-            r = ggml_add(ctx, r, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
-            return act(r, a);
         }
-        if (w->ne[2] == 1 && x->ne[2] != 1) { // depthwise
-            r = ggml_conv_2d_dw_direct(ctx, w, x, s, s, p, p, 1, 1);
-        } else {
-            ggml_tensor * im = ggml_im2col(ctx, w, x, s, s, p, p, 1, 1, true, GGML_TYPE_F32);
-            r = ggml_mul_mat(ctx,
-                ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2] * im->ne[3]),
-                ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2], w->ne[3]));
-            r = ggml_reshape_4d(ctx, r, im->ne[1], im->ne[2], im->ne[3], w->ne[3]);
-            r = ggml_cont(ctx, ggml_permute(ctx, r, 0, 1, 3, 2));
-        }
+        ggml_tensor * im = ggml_im2col(ctx, w, x, s, s, p, p, 1, 1, true, GGML_TYPE_F32);
+        r = ggml_mul_mat(ctx,
+            ggml_reshape_2d(ctx, im, im->ne[0], im->ne[1] * im->ne[2] * im->ne[3]),
+            ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2], w->ne[3]));
+        r = ggml_reshape_4d(ctx, r, im->ne[1], im->ne[2], im->ne[3], w->ne[3]);
+        r = ggml_cont(ctx, ggml_permute(ctx, r, 0, 1, 3, 2));
         r = ggml_add(ctx, r, ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1));
         return act(r, a);
     }
@@ -404,6 +561,8 @@ struct builder {
     }
 
     // image ne(W,H,C,1) -> sequence ne(C, W*H), token = y*W + x
+    // (kept as cont(permute): feeding views of custom-op outputs into stock
+    //  ops misplaces buffers under the CUDA-graph sched — see 2026-10 notes)
     ggml_tensor * to_seq(ggml_tensor * x) {
         ggml_tensor * t = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
         return ggml_reshape_2d(ctx, t, t->ne[0], t->ne[1] * t->ne[2]);
@@ -457,6 +616,7 @@ struct builder {
     void backbone(ggml_tensor * img, ggml_tensor ** x4, ggml_tensor ** p8,
                   ggml_tensor ** p16, ggml_tensor ** p32) {
         ggml_tensor * x = conv(img, "stem1", 2, 1, ACT_RELU);          // 400,32
+        if (stop_after == 12) { trunc_t = x; return; }
         dump("stem1", x);
         ggml_tensor * xp = ggml_pad(ctx, x, 1, 1, 0, 0);               // 401
         ggml_tensor * a = conv(xp, "stem2a", 1, 0, ACT_RELU);          // 400,16
@@ -464,7 +624,9 @@ struct builder {
         a = conv(a, "stem2b", 1, 0, ACT_RELU);                          // 400,32
         ggml_tensor * pl = ggml_pool_2d(ctx, xp, GGML_OP_POOL_MAX, 2, 2, 1, 1, 0, 0); // 400,32
         x = ggml_concat(ctx, pl, a, 2);                                 // 400,64
+        if (stop_after == 10) { trunc_t = x; return; }
         x = conv(x, "stem3", 2, 1, ACT_RELU);                           // 200,32
+        if (stop_after == 11) { trunc_t = x; return; }
         x = conv(x, "stem4", 1, 0, ACT_RELU);                           // 200,48
         dump("stem", x);
 
@@ -570,6 +732,7 @@ struct builder {
 
     void build(graph_out & go, ggml_cgraph * gf) {
         out = &go;
+        stop_after = getenv("PPDL_STOP") ? atoi(getenv("PPDL_STOP")) : 0;
 
         go.image = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, IMG, IMG, 3, 1);
         ggml_set_name(go.image, "image");
@@ -583,9 +746,37 @@ struct builder {
 
         ggml_tensor *x4, *p8, *p16, *p32;
         backbone(go.image, &x4, &p8, &p16, &p32);
+        if (trunc_t) {
+            ggml_set_output(trunc_t);
+            ggml_build_forward_expand(gf, trunc_t);
+            return;
+        }
+        if (stop_after >= 5) { // 5=stem, 6=+st0, 7=+st1, 8=+st2, 9=+st3
+            ggml_tensor * outs[4] = { x4, p8, p16, p32 };
+            const int keep = stop_after - 5;
+            for (int i = 0; i <= keep && i < 4; i++) ggml_set_output(outs[i]);
+            for (int i = 0; i <= keep && i < 4; i++) ggml_build_forward_expand(gf, outs[i]);
+            return;
+        }
+        if (stop_after == 1) {
+            ggml_set_output(x4); ggml_set_output(p8); ggml_set_output(p16); ggml_set_output(p32);
+            ggml_build_forward_expand(gf, x4);
+            ggml_build_forward_expand(gf, p8);
+            ggml_build_forward_expand(gf, p16);
+            ggml_build_forward_expand(gf, p32);
+            return;
+        }
 
         ggml_tensor *f8, *n16, *n32, *mfeat;
         encoder(x4, p8, p16, p32, go.pos, &f8, &n16, &n32, &mfeat);
+        if (stop_after == 2) {
+            ggml_set_output(f8); ggml_set_output(n16); ggml_set_output(n32); ggml_set_output(mfeat);
+            ggml_build_forward_expand(gf, f8);
+            ggml_build_forward_expand(gf, n16);
+            ggml_build_forward_expand(gf, n32);
+            ggml_build_forward_expand(gf, mfeat);
+            return;
+        }
 
         // mask_feat flattened: (32, 40000)
         ggml_tensor * mflat = ggml_reshape_2d(ctx,
@@ -597,6 +788,11 @@ struct builder {
         ggml_tensor * s2 = to_seq(conv(n32, "dec_in2", 1, 0, ACT_NONE));
         ggml_tensor * source = ggml_concat(ctx, ggml_concat(ctx, s0, s1, 1), s2, 1);
         dump("source", source);
+        if (stop_after == 3) {
+            ggml_set_output(source);
+            ggml_build_forward_expand(gf, source);
+            return;
+        }
 
         // two-stage selection
         ggml_tensor * memory = ggml_mul(ctx, source, go.valid);
@@ -606,6 +802,9 @@ struct builder {
         ggml_tensor * topk = ggml_custom_4d(ctx, GGML_TYPE_I32, NQ, 1, 1, 1,
                                             targs, 1, op_topk300, 1, nullptr);
         dump("topk_idx", topk);
+        if (gpu_convs) {
+            tag_custom_op(topk, 13); // GPU top-300: keeps the whole graph on CUDA
+        }
         ggml_tensor * target = ggml_get_rows(ctx, om, topk);           // (256,300)
         dump("target", target);
 
@@ -656,7 +855,9 @@ struct builder {
         go.logits = lin(outq, "score_head");                            // (25,300)
         go.boxes  = ref;                                                 // (4,300)
         ggml_tensor * mq6 = mlp3(outq, "mq");
-        go.masks = ggml_mul_mat(ctx, mflat, ggml_cont(ctx, mq6));        // (40000,300)
+        if (stop_after < 4) {
+            go.masks = ggml_mul_mat(ctx, mflat, ggml_cont(ctx, mq6));    // (40000,300)
+        }
         // order head consumes the final decoder hidden (pre dec_norm), per the ONNX export
         ggml_tensor * oh = lin(x, "order5");
         ggml_tensor * gp = lin(oh, "gp");                                // (128,300)
@@ -829,18 +1030,23 @@ static bool prof_enabled() {
 }
 
 static void prof_report(const prof_ctx & p) {
-    fprintf(stderr, "==== phase profile (top 40 by ms) ====\n");
-    std::vector<size_t> idx(p.rows.size());
-    std::iota(idx.begin(), idx.end(), 0);
+    // rows accumulate across iterations; report the last iteration's slice
+    size_t start = 0;
+    for (size_t i = 0; i < p.rows.size(); i++) {
+        if (p.rows[i].first.rfind("CUSTOM topk300", 0) == 0) start = i;
+    }
+    fprintf(stderr, "==== phase profile (last iter, top 40 by ms) ====\n");
+    std::vector<size_t> idx;
+    for (size_t i = start; i < p.rows.size(); i++) idx.push_back(i);
     std::partial_sort(idx.begin(), idx.begin() + std::min<size_t>(40, idx.size()), idx.end(),
                       [&](size_t a, size_t b) { return p.rows[a].second > p.rows[b].second; });
     double total = 0;
-    for (auto & r : p.rows) total += r.second;
+    for (size_t i = start; i < p.rows.size(); i++) total += p.rows[i].second;
     for (size_t k = 0; k < std::min<size_t>(40, idx.size()); k++) {
         const auto & r = p.rows[idx[k]];
         fprintf(stderr, "%8.2f ms %5.1f%% %s\n", r.second, 100.0 * r.second / total, r.first.c_str());
     }
-    fprintf(stderr, "sum-of-phases %.1f ms over %zu sync points\n", total, p.rows.size());
+    fprintf(stderr, "sum-of-phases %.1f ms over %zu sync points\n", total, p.rows.size() - start);
 }
 
 // ---------------------------------------------------------------- C API
@@ -934,8 +1140,8 @@ extern "C" PPDL_API ppdl_ctx * ppdl_init_ex(const char * model_path, int backend
     std::vector<float> pos, vm;
     fill_pos_embed(pos);
     fill_valid_mask(vm);
-    ggml_backend_tensor_set(c->go.pos, pos.data(), 0, pos.size() * 4);
-    ggml_backend_tensor_set(c->go.valid, vm.data(), 0, vm.size() * 4);
+    if (c->go.pos->buffer) ggml_backend_tensor_set(c->go.pos, pos.data(), 0, pos.size() * 4);
+    if (c->go.valid->buffer) ggml_backend_tensor_set(c->go.valid, vm.data(), 0, vm.size() * 4);
     return c;
 }
 
@@ -960,12 +1166,19 @@ extern "C" PPDL_API int ppdl_infer(ppdl_ctx * c, const float * image_chw,
     c->computed = true;
     if (c->profile) prof_report(c->prof);
 
+    if (!c->go.logits) { // truncated graph: timing only (PPDL_STOP)
+        result->dets = nullptr; result->num_dets = 0; result->masks = nullptr;
+        result->infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return 0;
+    }
     std::vector<float> logits((size_t) NQ * NC), boxes((size_t) NQ * 4);
     std::vector<float> order((size_t) NQ * NQ), maskl((size_t) NQ * MASK_PIX);
     ggml_backend_tensor_get(c->go.logits, logits.data(), 0, logits.size() * 4);
     ggml_backend_tensor_get(c->go.boxes,  boxes.data(),  0, boxes.size() * 4);
     ggml_backend_tensor_get(c->go.order,  order.data(),  0, order.size() * 4);
-    ggml_backend_tensor_get(c->go.masks,  maskl.data(),  0, maskl.size() * 4);
+    if (c->go.masks) {
+        ggml_backend_tensor_get(c->go.masks,  maskl.data(),  0, maskl.size() * 4);
+    }
 
     c->raw_logits = logits; c->raw_boxes = boxes; c->raw_order = order;
     postprocess(logits, boxes, order, maskl, ori_h, ori_w, c->out0, c->out2, &c->raw_sel);

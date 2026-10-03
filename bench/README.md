@@ -14,7 +14,17 @@ per-page verdict, with byte-level (md5) and page-level (thumbnail) dedup,
 python oracle_all.py [--exe ../build-verify/Release/ppdoclayout.exe] [--pdf SUBSTR]
 ```
 
-Last full run (2026-10-03, RTX 5080, ONNX Runtime 1.30 CPU as oracle):
+2026-10-04 perf round: conv-path rework (k1 = cuBLAS GEMM + fused bias/act;
+k3 s1 p1 = Winograd F(4,3): transform kernels + 36-plane batched SGEMM; GPU
+top-300) re-validated on the full corpus below — 4261/4261 pass, plus the
+12-page suite at score diff <= 1.4e-6, boxes <= 0.002 px. `PPDL_CONV_MODE`
+bisects the conv paths (bit1 k1-GEMM, bit2 k3-GEMM, bit8 fused bias/act,
+bit16 F(2,3), bit32 F(4,3); default = all three modern paths). Test helpers:
+`gemm_bench.cu` (GEMM path sweep that ruled out BF16x9 emulation),
+`wg_test.cu` (Winograd pipeline vs direct conv), `check_wg.py` (in-graph
+stage diff).
+
+Last full run (2026-10-04, RTX 5080, ONNX Runtime 1.30 CPU as oracle):
 **4261 unique pages from 37 PDFs — 4261 pass, 0 fail.** Every confident
 detection (score >= 0.30) on every page: identical class, identical relative
 reading order, boxes within 0.14 px (sub-pixel), masks IoU >= 0.99.

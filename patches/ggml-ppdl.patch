@@ -97,10 +97,10 @@ index 646a5899..ae10fc41 100644
          case GGML_TYPE_BF16:
 diff --git a/src/ggml-cuda/ppdl-ops.cu b/src/ggml-cuda/ppdl-ops.cu
 new file mode 100644
-index 00000000..27789c34
+index 00000000..4603683f
 --- /dev/null
 +++ b/src/ggml-cuda/ppdl-ops.cu
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,814 @@
 +// PP-DocLayoutV3 custom ops on CUDA (part of patches/ggml-fp32-parity.patch).
 +//
 +// The host code (ppdoclayout.cpp) tags its GGML_OP_CUSTOM tensors by writing
@@ -122,6 +122,77 @@ index 00000000..27789c34
 +#define PPDL_OP_MASKBOX 1
 +#define PPDL_OP_MSDEF   2
 +#define PPDL_OP_CONV    3 // decomposed conv: 1x1 or k3-s1 via batched cuBLAS GEMM
++#define PPDL_OP_CONVDIRECT 4 // fused direct conv (any K/S/PAD), CHW in/out
++#define PPDL_OP_BIASACT    5 // dst = act(in + bias[plane])
++#define PPDL_OP_COPY       6 // contiguous device-to-device copy
++#define PPDL_OP_WG_INPUT   7 // Winograd F(2,3) input transform  d~ = B d B^T
++#define PPDL_OP_WG_OUTPUT  8 // Winograd F(2,3) output transform Y = A^T m~ A (+bias+act)
++#define PPDL_OP_WG_MADD    9 // Winograd F(2,3) madd: 16-plane batched cuBLAS GEMM
++#define PPDL_OP_WG4_INPUT  10 // Winograd F(4,3) variants (36 planes over 4x4 tiles)
++#define PPDL_OP_WG4_OUTPUT 11
++#define PPDL_OP_WG4_MADD   12
++#define PPDL_OP_TOPK       13 // top-300 encoder queries on GPU (no CPU graph split)
++
++// Winograd F(2,3) transform matrices. Rank-4 decomposition of the 2-output
++// 3-tap correlation, solved numerically (the decomposition is unique up to
++// per-term scaling for this convention); rows balanced so max|B| == max|G|.
++// Verified against the direct correlation in float64 to 1e-13 and in float32
++// to ~1e-6 relative per tile — far inside the ONNX-oracle tolerance.
++// Winograd transform matrices. Rank-(TS-1) decompositions of the correlation
++// (F(2,3): 4 terms, F(4,3): 6 terms; unique up to per-term scaling), solved
++// numerically and row-balanced. Verified vs the direct correlation in float64
++// to 1e-13; float32 end-to-end tile error ~1e-6 relative — far inside the
++// ONNX-oracle tolerance. Stored row-major; B is TSxTS, G is TSx3 (the filter
++// transform W~ = G g G^T is folded at repack time), A is TSxOT.
++__constant__ float PPDL_WG_B2[16] = {
++     2.118156910f,  2.146311760f, -1.673836589f, -1.004659295f,
++     0.668844104f, -1.755281925f,  0.263708651f,  0.544651985f,
++    -0.479055941f,  0.242195174f,  1.683301687f,  0.669751883f,
++    -1.848919749f,  3.216520309f,  4.306654453f, -4.437918186f,
++};
++__constant__ float PPDL_WG_G2[12] = {
++     2.146311760f,  0.933696151f,  0.406179786f,
++    -1.755281925f,  1.310971141f, -0.979127824f,
++     1.023769975f,  1.312750459f,  1.683301687f,
++     0.915698946f, -2.015886307f,  4.437918186f,
++};
++__constant__ float PPDL_WG_A2[8] = {
++     0.175659597f,  0.076416060f,
++    -0.299846143f,  0.223946735f,
++     0.243508786f,  0.312244207f,
++     0.018418359f, -0.040547512f,
++};
++__constant__ float PPDL_WG_B4[36] = {
++     0.156081140f, -0.005399639f, -0.912340343f, -0.209068865f,  0.695356965f,  0.124203928f,
++    -0.153710172f, -0.110961877f,  0.797504783f,  0.794400156f,  0.002377054f, -0.019845223f,
++     0.423170745f, -0.936912060f, -0.566737831f,  0.947692990f,  0.041719031f, -0.024267767f,
++    -0.338096678f,  0.120876059f,  1.953236461f, -0.181245893f, -1.540627480f,  0.223424435f,
++     0.295037359f,  0.647394836f, -0.185275897f, -0.582640827f, -0.011674470f,  0.014480385f,
++     0.198828861f, -0.241681889f, -0.911203325f,  0.846514463f,  0.049163014f, -0.022408651f,
++};
++__constant__ float PPDL_WG_G4[18] = {
++    -0.019582119f, -0.133662105f, -0.912340343f,
++     0.650278211f,  0.720138848f,  0.797504783f,
++    -0.947692990f,  0.466171294f, -0.229310215f,
++     0.060792211f, -0.344588995f,  1.953236461f,
++     0.647394836f,  0.272543609f,  0.114736818f,
++    -0.911203325f,  0.880876958f, -0.851559937f,
++};
++__constant__ float PPDL_WG_A4[24] = {
++    -0.015757650f, -0.107557341f, -0.734156489f, -5.011147976f,
++     0.878285885f,  0.972641826f,  1.077134609f,  1.192853332f,
++    -1.655853987f,  0.814516485f, -0.400661618f,  0.197085932f,
++    -0.005868433f,  0.033264086f, -0.188551068f,  1.068765521f,
++     3.145301104f,  1.324125051f,  0.557437003f,  0.234672695f,
++     0.978109479f, -0.945556402f,  0.914086699f, -0.883664429f,
++};
++
++template <int TS> static __device__ __forceinline__ const float * ppdl_wg_B() {
++    return TS == 6 ? PPDL_WG_B4 : PPDL_WG_B2;
++}
++template <int TS, int OT> static __device__ __forceinline__ const float * ppdl_wg_A() {
++    return TS == 6 ? PPDL_WG_A4 : PPDL_WG_A2;
++}
 +
 +#define PPDL_DM        256
 +#define PPDL_NH        8
@@ -240,6 +311,304 @@ index 00000000..27789c34
 +    out[(size_t) q * PPDL_DM + h * PPDL_HD + lane] = acc;
 +}
 +
++// ---- direct convolution (perf round 2) -------------------------------------
++// One kernel per dense conv: CHW input, repacked (K*K, IC, OC) weights, fused
++// bias + activation, CHW output written directly. Replaces the k3 GEMM
++// decomposition (9x beta-accumulate RMW over the output, plus pad_ext and a
++// permute+cont on the result) and the stock im2col path used by the stride-2
++// and k2 convs (9x input materialization, GEMM, permute, cont).
++//
++// Threading: lane = output channel, each thread owns PPT consecutive output
++// pixels. Per (tap, ic): one broadcast load of the input value (all lanes see
++// the same pixel) + one coalesced load of the weight column -> PPT FMAs per
++// lane. That keeps the L1 transaction count at ~2 per PPT*32 FMAs, which a
++// pixel-per-lane mapping cannot do (weight re-broadcast per pixel).
++//
++// Numerics: per tap t, s = sum_ic w[t][ic][oc]*x[..] accumulated with
++// sequential FMA, then acc += s — the same tap-major order the GEMM path used.
++// Activation: relu exact; silu uses expf (matches ggml's silu.cu under the
++// same --use_fast_math flags).
++
++#define PPDL_PPT 8 // output pixels per thread
++
++template <int K, int S, int PAD, int ACT>
++static __global__ void ppdl_conv_direct_kernel(
++        const float * __restrict__ x,   // (IW,IH,IC) CHW
++        const float * __restrict__ w,   // (K*K,IC,OC)
++        const float * __restrict__ b,   // (OC,)
++        float * __restrict__ out,       // (OW,OH,OC) CHW
++        const int IW, const int IH, const int IC,
++        const int OW, const int OH, const int OC) {
++    const int oc = blockIdx.y * blockDim.x + threadIdx.x;
++    const bool oc_ok = oc < OC;
++    const int64_t IP = (int64_t) IH * IW;
++    const int64_t OP = (int64_t) OH * OW;
++
++    float acc[PPDL_PPT];
++#pragma unroll
++    for (int j = 0; j < PPDL_PPT; j++) acc[j] = oc_ok ? b[oc] : 0.0f;
++
++#pragma unroll
++    for (int t = 0; t < K * K; t++) {
++        const int kh = t / K, kw = t - kh * K;
++        const float * wr = w + (int64_t) t * IC * OC + oc;
++        const float * xr[PPDL_PPT];
++        bool valid[PPDL_PPT];
++#pragma unroll
++        for (int j = 0; j < PPDL_PPT; j++) {
++            const int p = (int) blockIdx.x * PPDL_PPT + j;
++            const int py = p / OW;
++            const int px = p - py * OW;
++            const int iy = py * S + kh - PAD;
++            const int ix = px * S + kw - PAD;
++            valid[j] = oc_ok && p < OP && iy >= 0 && iy < IH && ix >= 0 && ix < IW;
++            xr[j] = x + (int64_t) iy * IW + ix;
++        }
++#pragma unroll 4
++        for (int ic = 0; ic < IC; ic++) {
++            const float wv = wr[(int64_t) ic * OC];
++#pragma unroll
++            for (int j = 0; j < PPDL_PPT; j++) {
++                if (valid[j]) acc[j] = fmaf(wv, xr[j][(int64_t) ic * IP], acc[j]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int j = 0; j < PPDL_PPT; j++) {
++        const int p = (int) blockIdx.x * PPDL_PPT + j;
++        if (oc_ok && p < OP) {
++            float v = acc[j];
++            if (ACT == 1) {
++                v = fmaxf(v, 0.0f);
++            } else if (ACT == 2) {
++                v = v / (1.0f + expf(-v));
++            }
++            out[(int64_t) oc * OP + p] = v;
++        }
++    }
++}
++
++template <int K, int S, int PAD, int ACT>
++static void ppdl_conv_direct_launch(const float * x, const float * w, const float * b,
++                                    float * out, int IW, int IH, int IC,
++                                    int OW, int OH, int OC, cudaStream_t stream) {
++    const int64_t OP = (int64_t) OH * OW;
++    const int lanes = OC < 128 ? (OC + 31) & ~31 : 128;
++    dim3 grid((unsigned) ((OP + PPDL_PPT - 1) / PPDL_PPT),
++              (unsigned) ((OC + lanes - 1) / lanes));
++    ppdl_conv_direct_kernel<K, S, PAD, ACT><<<grid, lanes, 0, stream>>>(
++        x, w, b, out, IW, IH, IC, OW, OH, OC);
++}
++
++template <int K, int S, int PAD>
++static bool ppdl_conv_direct_act(int act, const float * x, const float * w, const float * b,
++                                 float * out, int IW, int IH, int IC,
++                                 int OW, int OH, int OC, cudaStream_t stream) {
++    switch (act) {
++        case 0: ppdl_conv_direct_launch<K, S, PAD, 0>(x, w, b, out, IW, IH, IC, OW, OH, OC, stream); break;
++        case 1: ppdl_conv_direct_launch<K, S, PAD, 1>(x, w, b, out, IW, IH, IC, OW, OH, OC, stream); break;
++        case 2: ppdl_conv_direct_launch<K, S, PAD, 2>(x, w, b, out, IW, IH, IC, OW, OH, OC, stream); break;
++        default: return false;
++    }
++    return true;
++}
++
++// dst = act(src0 + bias[plane]); src0/dst (C,P) CHW contiguous, bias (C,)
++static __global__ void ppdl_bias_act_kernel(const float * __restrict__ in,
++                                            const float * __restrict__ b,
++                                            float * __restrict__ out,
++                                            const int64_t n, const int64_t pplane,
++                                            const int act) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    float v = in[i] + b[i / pplane];
++    if (act == 1) {
++        v = fmaxf(v, 0.0f);
++    } else if (act == 2) {
++        v = v / (1.0f + expf(-v));
++    }
++    out[i] = v;
++}
++
++static __global__ void ppdl_copy_kernel(const float * __restrict__ in,
++                                        float * __restrict__ out, const int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) out[i] = in[i];
++}
++
++// ---- GPU topk300 -------------------------------------------------------------
++// Replaces the CPU custom op (which forced a mid-graph sched split: D2H sync,
++// CPU partial sort, H2D). One block: pack each token's max-class logit into a
++// sortable u64 key (sign-flipped float bits << 32 | ~index — ties resolve to
++// the lower index exactly like the CPU reference), then extract the top-300
++// keys with 300 block reductions, zeroing each winner in registers.
++#define PPDL_TOPK_TP 13 // ceil(13125 / 1024)
++static __global__ void ppdl_topk_kernel(const float * __restrict__ lg,
++                                        int32_t * __restrict__ out,
++                                        const int ntok, const int nc, const int nq) {
++    __shared__ uint64_t red[1024];
++    uint64_t key[PPDL_TOPK_TP];
++    int nloc = 0;
++    for (int q = threadIdx.x; q < ntok; q += blockDim.x) {
++        const float * p = lg + (size_t) q * nc;
++        float m = p[0];
++        for (int c = 1; c < nc; c++) m = fmaxf(m, p[c]);
++        uint32_t u = __float_as_uint(m);
++        u ^= (u >> 31) ? 0xFFFFFFFFu : 0x80000000u;
++        key[nloc++] = ((uint64_t) u << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) q);
++    }
++    for (; nloc < PPDL_TOPK_TP; nloc++) key[nloc] = 0;
++    for (int r = 0; r < nq; r++) {
++        uint64_t loc = 0;
++#pragma unroll
++        for (int i = 0; i < PPDL_TOPK_TP; i++) {
++            if (key[i] > loc) loc = key[i];
++        }
++        red[threadIdx.x] = loc;
++        __syncthreads();
++        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
++            if (threadIdx.x < st && red[threadIdx.x + st] > red[threadIdx.x]) {
++                red[threadIdx.x] = red[threadIdx.x + st];
++            }
++            __syncthreads();
++        }
++        const uint64_t w = red[0];
++        if (threadIdx.x == 0) {
++            out[r] = (int32_t) (0xFFFFFFFFu - (uint32_t) (w & 0xFFFFFFFFu));
++        }
++        const int wq = (int) (0xFFFFFFFFu - (uint32_t) (w & 0xFFFFFFFFu));
++        if ((int) threadIdx.x == wq % (int) blockDim.x) {
++            key[wq / (int) blockDim.x] = 0;
++        }
++        __syncthreads();
++    }
++}
++
++// ---- Winograd F(2,3) / F(4,3) (k3 s1 p1 dense convs) ------------------------
++// Pipeline per conv: pad to the tile grid -> input transform (op 7/10) ->
++// TS*TS independent (T x IC)·(IC x OC) GEMMs via cuBLAS strided-batch (op 9/11)
++// -> output transform fused with bias+act (op 8/12). F(4,3) quarter-sizes the
++// madd domain vs F(2,3) (36 planes over P/16 tiles vs 16 planes over P/4),
++// halving GEMM FLOPs and cutting transform traffic. The transforms are pure
++// bandwidth; cuBLAS keeps the madd at SGEMM efficiency.
++
++// src0: padded input (IW_p,IH_p,IC) CHW. dst: (T,IC,P), plane p = u*TS+v holds
++// d~[u][v] per tile as (IC,T) row-major (col-major (T,IC) with ld=IC for the GEMM).
++template <int TS, int OT>
++static __global__ void ppdl_wg_input_kernel(const float * __restrict__ x,
++                                            float * __restrict__ dt,
++                                            const int IW, const int IH, const int IC,
++                                            const int TW, const int TH) {
++    const int T = TW * TH;
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (int64_t) T * IC) return;
++    const int ic = (int) (idx / T);
++    const int tile = (int) (idx - (int64_t) ic * T);
++    const int ty = tile / TW, tx = tile - ty * TW;
++    const int STEP = OT; // output-pixel stride between tiles
++
++    float d[TS][TS];
++#pragma unroll
++    for (int a = 0; a < TS; a++) {
++        const int iy = STEP * ty + a;
++#pragma unroll
++        for (int b = 0; b < TS; b++) {
++            const int ix = STEP * tx + b;
++            d[a][b] = x[((int64_t) ic * IH + iy) * IW + ix];
++        }
++    }
++    float t1[TS][TS], o[TS * TS];
++    const float * Bm = ppdl_wg_B<TS>();
++#pragma unroll
++    for (int u = 0; u < TS; u++) {
++#pragma unroll
++        for (int v = 0; v < TS; v++) {
++            float s = 0.0f;
++#pragma unroll
++            for (int a = 0; a < TS; a++) s = fmaf(Bm[u * TS + a], d[a][v], s);
++            t1[u][v] = s;
++        }
++    }
++#pragma unroll
++    for (int u = 0; u < TS; u++) {
++#pragma unroll
++        for (int w = 0; w < TS; w++) {
++            float s = 0.0f;
++#pragma unroll
++            for (int b = 0; b < TS; b++) s = fmaf(t1[u][b], Bm[w * TS + b], s);
++            o[u * TS + w] = s;
++        }
++    }
++#pragma unroll
++    for (int p = 0; p < TS * TS; p++) {
++        dt[((int64_t) p * IC + ic) * T + tile] = o[p];
++    }
++}
++
++// src0: yt (T,OC,P) planes, src1: bias (OC). dst: (OW,OH,OC) CHW + bias + act.
++template <int TS, int OT>
++static __global__ void ppdl_wg_output_kernel(const float * __restrict__ yt,
++                                             const float * __restrict__ bias,
++                                             float * __restrict__ out,
++                                             const int T, const int TW, const int OC,
++                                             const int OW, const int OH, const int act) {
++    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= (int64_t) T * OC) return;
++    const int oc = (int) (idx / T);
++    const int tile = (int) (idx - (int64_t) oc * T);
++    const int ty = tile / TW, tx = tile - ty * TW;
++
++    float m[TS * TS];
++#pragma unroll
++    for (int p = 0; p < TS * TS; p++) m[p] = yt[((int64_t) p * OC + oc) * T + tile];
++
++    const float * Am = ppdl_wg_A<TS, OT>();
++    float t1[OT][TS], Y[OT][OT];
++#pragma unroll
++    for (int i = 0; i < OT; i++) {
++#pragma unroll
++        for (int v = 0; v < TS; v++) {
++            float s = 0.0f;
++#pragma unroll
++            for (int u = 0; u < TS; u++) s = fmaf(Am[u * OT + i], m[u * TS + v], s);
++            t1[i][v] = s;
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < OT; i++) {
++#pragma unroll
++        for (int j = 0; j < OT; j++) {
++            float s = 0.0f;
++#pragma unroll
++            for (int v = 0; v < TS; v++) s = fmaf(t1[i][v], Am[v * OT + j], s);
++            Y[i][j] = s + bias[oc];
++        }
++    }
++    if (act == 1) {
++#pragma unroll
++        for (int i = 0; i < OT; i++)
++#pragma unroll
++            for (int j = 0; j < OT; j++) Y[i][j] = fmaxf(Y[i][j], 0.0f);
++    } else if (act == 2) {
++#pragma unroll
++        for (int i = 0; i < OT; i++)
++#pragma unroll
++            for (int j = 0; j < OT; j++) Y[i][j] = Y[i][j] / (1.0f + expf(-Y[i][j]));
++    }
++    const int64_t OP = (int64_t) OW * OH;
++#pragma unroll
++    for (int i = 0; i < OT; i++) {
++        const int py = OT * ty + i;
++        if (py >= OH) break;
++#pragma unroll
++        for (int j = 0; j < OT; j++) {
++            const int px = OT * tx + j;
++            if (px < OW) out[(int64_t) oc * OP + py * OW + px] = Y[i][j];
++        }
++    }
++}
++
 +bool ggml_cuda_compute_forward_ppdl(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
 +    const int32_t * p = (const int32_t *) dst->op_params;
 +    cudaStream_t stream = ctx.stream();
@@ -315,6 +684,131 @@ index 00000000..27789c34
 +                }
 +            }
 +            (void) pad;
++        } break;
++        case PPDL_OP_CONVDIRECT: {
++            // srcs: x (IW,IH,IC) CHW contiguous, w repacked (K*K,IC,OC), b (OC)
++            // params [14]: K | (S<<8) | (PAD<<16) | (ACT<<24); ACT 0/1/2 = none/relu/silu
++            const ggml_tensor * x = s0;
++            const ggml_tensor * w = dst->src[1];
++            const ggml_tensor * b = dst->src[2];
++            const int K   = p[14] & 0xFF;
++            const int S   = (p[14] >> 8) & 0xFF;
++            const int PAD = (p[14] >> 16) & 0xFF;
++            const int ACT = (p[14] >> 24) & 0xFF;
++            const int IW = (int) x->ne[0], IH = (int) x->ne[1], IC = (int) x->ne[2];
++            const int OW = (int) dst->ne[0], OH = (int) dst->ne[1], OC = (int) dst->ne[2];
++            GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w));
++            const float * xd = (const float *) x->data;
++            const float * wd = (const float *) w->data;
++            const float * bd = (const float *) b->data;
++            float * od = (float *) dst->data;
++            bool ok = false;
++            if (K == 3 && S == 1 && PAD == 1) {
++                ok = ppdl_conv_direct_act<3, 1, 1>(ACT, xd, wd, bd, od, IW, IH, IC, OW, OH, OC, stream);
++            } else if (K == 3 && S == 2 && PAD == 1) {
++                ok = ppdl_conv_direct_act<3, 2, 1>(ACT, xd, wd, bd, od, IW, IH, IC, OW, OH, OC, stream);
++            } else if (K == 2 && S == 1 && PAD == 0) {
++                ok = ppdl_conv_direct_act<2, 1, 0>(ACT, xd, wd, bd, od, IW, IH, IC, OW, OH, OC, stream);
++            } else if (K == 1 && S == 1 && PAD == 0) {
++                ok = ppdl_conv_direct_act<1, 1, 0>(ACT, xd, wd, bd, od, IW, IH, IC, OW, OH, OC, stream);
++            }
++            if (!ok) {
++                GGML_ABORT("ppdl conv_direct: unsupported K/S/PAD/ACT combo");
++            }
++        } break;
++        case PPDL_OP_BIASACT: {
++            // srcs: in (C,P) contiguous, bias (C,). params [14]: ACT
++            const int64_t n = ggml_nelements(dst);
++            const int64_t pplane = dst->ne[0] * dst->ne[1];
++            const int act = p[14];
++            const int blocks = (int) ((n + 255) / 256);
++            ppdl_bias_act_kernel<<<blocks, 256, 0, stream>>>(
++                (const float *) s0->data, (const float *) dst->src[1]->data,
++                (float *) dst->data, n, pplane, act);
++        } break;
++        case PPDL_OP_COPY: {
++            const int64_t n = ggml_nelements(dst);
++            const int blocks = (int) ((n + 255) / 256);
++            ppdl_copy_kernel<<<blocks, 256, 0, stream>>>(
++                (const float *) s0->data, (float *) dst->data, n);
++        } break;
++        case PPDL_OP_WG_INPUT: {
++            // src0: padded (IW,IH,IC) CHW; dst: (T,IC,16); params[14]=TW, [15]=TH
++            const int IW = (int) s0->ne[0], IH = (int) s0->ne[1], IC = (int) s0->ne[2];
++            const int T = p[14], TH = p[15], TW = T / TH;
++            GGML_ASSERT(ggml_is_contiguous(s0) && ggml_is_contiguous(dst));
++            const int64_t n = (int64_t) T * IC;
++            ppdl_wg_input_kernel<4, 2><<<(int) ((n + 255) / 256), 256, 0, stream>>>(
++                (const float *) s0->data, (float *) dst->data, IW, IH, IC, TW, TH);
++        } break;
++        case PPDL_OP_WG_MADD: {
++            // src0: dt (T,IC,16); src1: wg (16,IC,OC); dst: yt (T,OC,16)
++            const ggml_tensor * dt = s0;
++            const ggml_tensor * wg = dst->src[1];
++            const int64_t T = dst->ne[0], OC = dst->ne[1], IC = dt->ne[1];
++            float alpha = 1.0f, beta = 0.0f;
++            cublasHandle_t h = ctx.cublas_handle();
++            CUBLAS_CHECK(cublasSetStream(h, stream));
++            CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
++            CUBLAS_CHECK(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T,
++                    (int) T, (int) OC, (int) IC,
++                    &alpha, (const float *) dt->data, (int) T, (int64_t) IC * T,
++                            (const float *) wg->data, (int) OC, (int64_t) IC * OC,
++                    &beta, (float *) dst->data, (int) T, (int64_t) OC * T,
++                    16));
++        } break;
++        case PPDL_OP_WG_OUTPUT: {
++            // src0: yt (T,OC,16); src1: bias (OC); dst: (OW,OH,OC)
++            // params[14]=act, [15]=TW
++            const int OW = (int) dst->ne[0], OH = (int) dst->ne[1], OC = (int) dst->ne[2];
++            const int TW = p[15];
++            const int T = ((OW + 1) / 2) * ((OH + 1) / 2);
++            const int64_t n = (int64_t) T * OC;
++            ppdl_wg_output_kernel<4, 2><<<(int) ((n + 255) / 256), 256, 0, stream>>>(
++                (const float *) s0->data, (const float *) dst->src[1]->data,
++                (float *) dst->data, T, TW, OC, OW, OH, p[14]);
++        } break;
++        case PPDL_OP_TOPK: {
++            // src0: class logits (nc,ntok); dst: (nq) i32
++            const int ntok = (int) s0->ne[1], nc = (int) s0->ne[0], nq = (int) dst->ne[0];
++            GGML_ASSERT(ntok <= 1024 * PPDL_TOPK_TP);
++            ppdl_topk_kernel<<<1, 1024, 0, stream>>>(
++                (const float *) s0->data, (int32_t *) dst->data, ntok, nc, nq);
++        } break;
++        case PPDL_OP_WG4_INPUT: {
++            // src0: padded (IW,IH,IC) CHW; dst: (T,IC,36); params[14]=T, [15]=TH
++            const int IW = (int) s0->ne[0], IH = (int) s0->ne[1], IC = (int) s0->ne[2];
++            const int T = p[14], TH = p[15], TW = T / TH;
++            GGML_ASSERT(ggml_is_contiguous(s0) && ggml_is_contiguous(dst));
++            const int64_t n = (int64_t) T * IC;
++            ppdl_wg_input_kernel<6, 4><<<(int) ((n + 255) / 256), 256, 0, stream>>>(
++                (const float *) s0->data, (float *) dst->data, IW, IH, IC, TW, TH);
++        } break;
++        case PPDL_OP_WG4_MADD: {
++            // src0: dt (T,IC,36); src1: wg (36,IC,OC); dst: yt (T,OC,36)
++            const ggml_tensor * dt = s0;
++            const ggml_tensor * wg = dst->src[1];
++            const int64_t T = dst->ne[0], OC = dst->ne[1], IC = dt->ne[1];
++            float alpha = 1.0f, beta = 0.0f;
++            cublasHandle_t h = ctx.cublas_handle();
++            CUBLAS_CHECK(cublasSetStream(h, stream));
++            CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
++            CUBLAS_CHECK(cublasSgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T,
++                    (int) T, (int) OC, (int) IC,
++                    &alpha, (const float *) dt->data, (int) T, (int64_t) IC * T,
++                            (const float *) wg->data, (int) OC, (int64_t) IC * OC,
++                    &beta, (float *) dst->data, (int) T, (int64_t) OC * T,
++                    36));
++        } break;
++        case PPDL_OP_WG4_OUTPUT: {
++            // src0: yt (T,OC,36); src1: bias (OC); dst: (OW,OH,OC)
++            const int OW = (int) dst->ne[0], OH = (int) dst->ne[1], OC = (int) dst->ne[2];
++            const int TW = p[15];
++            const int T = ((OW + 3) / 4) * ((OH + 3) / 4);
++            const int64_t n = (int64_t) T * OC;
++            ppdl_wg_output_kernel<6, 4><<<(int) ((n + 255) / 256), 256, 0, stream>>>(
++                (const float *) s0->data, (const float *) dst->src[1]->data,
++                (float *) dst->data, T, TW, OC, OW, OH, p[14]);
 +        } break;
 +        default:
 +            return false;
@@ -415,7 +909,11 @@ index 00000000..27789c34
 +    if (op->op != GGML_OP_CUSTOM) return false;
 +    const int32_t * p = (const int32_t *) op->op_params;
 +    return p[12] == PPDL_MAGIC &&
-+           (p[13] == PPDL_OP_MASKBOX || p[13] == PPDL_OP_MSDEF || p[13] == PPDL_OP_CONV);
++           (p[13] == PPDL_OP_MASKBOX || p[13] == PPDL_OP_MSDEF || p[13] == PPDL_OP_CONV ||
++            p[13] == PPDL_OP_CONVDIRECT || p[13] == PPDL_OP_BIASACT || p[13] == PPDL_OP_COPY ||
++            p[13] == PPDL_OP_WG_INPUT || p[13] == PPDL_OP_WG_OUTPUT || p[13] == PPDL_OP_WG_MADD ||
++            p[13] == PPDL_OP_WG4_INPUT || p[13] == PPDL_OP_WG4_OUTPUT || p[13] == PPDL_OP_WG4_MADD ||
++            p[13] == PPDL_OP_TOPK);
 +}
 diff --git a/src/ggml-cuda/ppdl-ops.cuh b/src/ggml-cuda/ppdl-ops.cuh
 new file mode 100644

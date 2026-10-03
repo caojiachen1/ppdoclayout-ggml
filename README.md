@@ -81,13 +81,25 @@ Full API reference: [docs/API.en.md](docs/API.en.md) ([中文](docs/API.md)).
 |---|---|
 | onnxruntime 1.30 (CPU, 24T) | 300 – 550 ms |
 | ggml (CPU) | ~1600 ms |
-| ggml (CUDA, RTX 5080) | **~18 ms** |
+| ggml (CUDA, RTX 5080) | **~12 ms** |
 | ggml (CUDA, RTX 4060, before the 2026-10 optimization round) | ~100 ms |
 
 CUDA notes: `GGML_CUDA_GRAPHS` is forced on for `USE_CUDA` builds (removes
-per-kernel launch overhead for the ~1300-node graph). The remaining wall time
-is dominated by the backbone's memory traffic; numerics stay FP32 throughout
-(TF32 off), so oracle parity is preserved.
+per-kernel launch overhead of the ~1000-node graph). The 2026-10 perf round
+took the RTX 5080 from ~17.6 ms to ~12.1 ms:
+
+- 1x1 convs run as single cuBLAS GEMMs writing CHW directly, with the bias +
+  activation fused into one follow-up kernel (tagged custom ops)
+- k3 s1 p1 convs run as **Winograd F(4,3)**: input transform → 36-plane
+  batched cuBLAS SGEMM (4x fewer FLOPs than the direct convolution) → output
+  transform fused with bias + activation (tagged custom ops; matrices solved
+  numerically, FP32 tile error ~1e-6, oracle-exact)
+- k2 / k3-s2 convs stay on the coalesced F32 im2col + SGEMM path
+- numerics stay FP32 throughout (TF32 off), so oracle parity is preserved
+
+The remaining wall time is dominated by FP32 GEMM work (~30 TFLOPS ceiling
+with tensor cores unusable under the parity constraint — BF16x9 emulation
+measured at 1.0x on this part).
 
 ## Correctness
 
